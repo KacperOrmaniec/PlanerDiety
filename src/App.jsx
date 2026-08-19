@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from "react";
 import { RECIPES } from "./data/recipes.js";
 import { STEPS } from "./data/instructions.js";
 import { ING_CAT } from "./data/categories.js";
+import { supabase } from "./lib/supabaseClient.js";
 
 const CATS = ["Śniadanie", "Obiad", "Kolacja", "Przekąska"];
 const CAT_COLORS = { "Śniadanie": "#E8A13C", "Obiad": "#3D7A46", "Kolacja": "#5B6ABF", "Przekąska": "#C2588A" };
@@ -194,7 +195,34 @@ function RecipeModal({ recipe, onClose }) {
   );
 }
 
-export default function App() {
+const pendingKey = userId => `pending-sync-${userId}`;
+
+function readPending(userId) {
+  try { return JSON.parse(localStorage.getItem(pendingKey(userId))) || {}; }
+  catch { return {}; }
+}
+
+function clearPendingColumn(userId, column) {
+  const rest = readPending(userId);
+  delete rest[column];
+  if (Object.keys(rest).length) localStorage.setItem(pendingKey(userId), JSON.stringify(rest));
+  else localStorage.removeItem(pendingKey(userId));
+}
+
+// Column writes are whole-value overwrites (not diffs), so "queueing" just means:
+// keep the latest value in localStorage and keep retrying until Supabase confirms it.
+function syncColumn(userId, column, value) {
+  const pending = readPending(userId);
+  localStorage.setItem(pendingKey(userId), JSON.stringify({ ...pending, [column]: value }));
+  supabase.from("plans").update({ [column]: value, updated_at: new Date().toISOString() }).eq("user_id", userId)
+    .then(({ error }) => {
+      if (error) { console.error(error); return; }
+      clearPendingColumn(userId, column);
+    });
+}
+
+export default function App({ session }) {
+  const user = session.user;
   const today = new Date();
   const [tab, setTab] = useState("cal");
   const [view, setView] = useState({ y: today.getFullYear(), m: today.getMonth() });
@@ -211,21 +239,51 @@ export default function App() {
   const [goals, setGoals] = useState({ global: 2400, days: {} });
 
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem("diet-plan-v1");
-      if (saved) setPlan(JSON.parse(saved));
-      const savedEaten = localStorage.getItem("diet-eaten-v1");
-      if (savedEaten) setEaten(JSON.parse(savedEaten));
-      const savedGoals = localStorage.getItem("diet-target-v1");
-      if (savedGoals) setGoals(g => ({ ...g, ...JSON.parse(savedGoals) }));
-    } catch (e) { /* brak zapisanego planu */ }
-    setLoaded(true);
-  }, []);
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from("plans")
+        .select("plan, eaten, goals")
+        .eq("user_id", user.id)
+        .maybeSingle();
+      if (cancelled) return;
+      const pending = readPending(user.id);
+      const restorePending = () => {
+        if (pending.plan) setPlan(pending.plan);
+        if (pending.eaten) setEaten(pending.eaten);
+        if (pending.goals) setGoals(g => ({ ...g, ...pending.goals }));
+      };
+      if (data) {
+        setPlan(pending.plan ?? data.plan ?? {});
+        setEaten(pending.eaten ?? data.eaten ?? {});
+        setGoals(g => ({ ...g, ...(data.goals || {}), ...(pending.goals || {}) }));
+      } else if (!error) {
+        const { error: insertError } = await supabase.from("plans").insert({ user_id: user.id });
+        if (insertError) console.error(insertError);
+        restorePending();
+      } else {
+        console.error(error);
+        restorePending();
+      }
+      if (!cancelled) setLoaded(true);
+    })();
+    return () => { cancelled = true; };
+  }, [user.id]);
 
   useEffect(() => {
     if (!loaded) return;
-    try { localStorage.setItem("diet-target-v1", JSON.stringify(goals)); } catch (e) { console.error(e); }
-  }, [goals, loaded]);
+    const flush = () => {
+      const pending = readPending(user.id);
+      for (const column of Object.keys(pending)) syncColumn(user.id, column, pending[column]);
+    };
+    window.addEventListener("online", flush);
+    return () => window.removeEventListener("online", flush);
+  }, [loaded, user.id]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    syncColumn(user.id, "goals", goals);
+  }, [goals, loaded, user.id]);
 
   const targetFor = k => goals.days[k] || goals.global;
 
@@ -244,13 +302,13 @@ export default function App() {
 
   useEffect(() => {
     if (!loaded) return;
-    try { localStorage.setItem("diet-plan-v1", JSON.stringify(plan)); } catch (e) { console.error(e); }
-  }, [plan, loaded]);
+    syncColumn(user.id, "plan", plan);
+  }, [plan, loaded, user.id]);
 
   useEffect(() => {
     if (!loaded) return;
-    try { localStorage.setItem("diet-eaten-v1", JSON.stringify(eaten)); } catch (e) { console.error(e); }
-  }, [eaten, loaded]);
+    syncColumn(user.id, "eaten", eaten);
+  }, [eaten, loaded, user.id]);
 
   const clearEaten = (dateKey, cat) => setEaten(p => {
     if (!p[dateKey] || !p[dateKey][cat]) return p;
@@ -371,9 +429,15 @@ export default function App() {
 
       <header style={{ background: "#22301F", color: "#F3F6EC", padding: "18px 20px 0" }}>
         <div style={{ maxWidth: 1060, margin: "0 auto" }}>
-          <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
-            <h1 style={{ fontFamily: "'Fraunces', serif", fontSize: 26, margin: 0 }}>Planer diety</h1>
-            <span style={{ fontSize: 13, color: "#A9B69B" }}>{RECIPES.length} przepisów · cel {goals.global} kcal</span>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+              <h1 style={{ fontFamily: "'Fraunces', serif", fontSize: 26, margin: 0 }}>Planer diety</h1>
+              <span style={{ fontSize: 13, color: "#A9B69B" }}>{RECIPES.length} przepisów · cel {goals.global} kcal</span>
+            </div>
+            <button onClick={() => supabase.auth.signOut()} title={user.email} style={{
+              border: "1.5px solid rgba(255,255,255,0.25)", background: "none", color: "#D5DEC8",
+              borderRadius: 10, padding: "6px 12px", fontSize: 12.5, fontWeight: 600, cursor: "pointer"
+            }}>Wyloguj</button>
           </div>
           <nav style={{ display: "flex", gap: 6, marginTop: 14 }}>
             {[["cal","📅 Kalendarz"],["shop","🛒 Lista zakupów"]].map(([id, label]) => (
