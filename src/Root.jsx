@@ -3,7 +3,8 @@ import { supabase, supabaseConfigured } from "./lib/supabaseClient.js";
 import Auth from "./Auth.jsx";
 import App from "./App.jsx";
 
-const CARD = { minHeight: "100vh", background: "#F7F9F3", display: "flex", alignItems: "center", justifyContent: "center", padding: 24, fontFamily: "'Work Sans', system-ui, sans-serif" };
+const INK = "#141210";
+const CARD = { minHeight: "100dvh", background: "#EFE7D8", display: "flex", alignItems: "center", justifyContent: "center", padding: 24, fontFamily: "'Bricolage Grotesque', system-ui, sans-serif" };
 
 export default function Root() {
   const [session, setSession] = useState(undefined); // undefined = still checking, null = signed out
@@ -18,9 +19,9 @@ export default function Root() {
   if (!supabaseConfigured) {
     return (
       <div style={CARD}>
-        <div style={{ maxWidth: 420, background: "#fff", borderRadius: 16, padding: 24, boxShadow: "0 2px 10px rgba(34,48,31,0.06)", color: "#22301F" }}>
-          <h2 style={{ fontFamily: "'Fraunces', serif", fontSize: 19, margin: "0 0 10px" }}>Brak konfiguracji Supabase</h2>
-          <p style={{ fontSize: 13.5, color: "#5C6852", lineHeight: 1.5, margin: 0 }}>
+        <div style={{ maxWidth: 420, background: "#FBF7EE", border: `3px solid ${INK}`, boxShadow: `5px 5px 0 ${INK}`, padding: 22, color: INK }}>
+          <h2 style={{ fontSize: 19, fontWeight: 800, margin: "0 0 10px", textTransform: "uppercase", letterSpacing: -0.4 }}>Brak konfiguracji Supabase</h2>
+          <p style={{ fontSize: 13, color: "#6E6656", lineHeight: 1.6, margin: 0 }}>
             Utwórz plik <code>.env.local</code> na podstawie <code>.env.example</code> i uzupełnij{" "}
             <code>VITE_SUPABASE_URL</code> oraz <code>VITE_SUPABASE_ANON_KEY</code>, a następnie zrestartuj{" "}
             <code>npm run dev</code>.
@@ -31,7 +32,7 @@ export default function Root() {
   }
 
   if (session === undefined) {
-    return <div style={{ ...CARD, color: "#7A836F", fontSize: 14 }}>Wczytywanie…</div>;
+    return <div style={{ ...CARD, color: "#6E6656", fontSize: 13, fontFamily: "'JetBrains Mono', ui-monospace, monospace" }}>Wczytywanie…</div>;
   }
 
   return session ? <App session={session} /> : <Auth />;
