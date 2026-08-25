@@ -77,8 +77,8 @@ function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
     color: active ? "#2A4A32" : "#5C6852", borderRadius: 20, padding: "5px 12px", fontSize: 12.5, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap"
   });
   return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(20,28,18,0.55)", zIndex: 40, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
-      <div onClick={e => e.stopPropagation()} style={{ background: "#fff", borderRadius: 18, maxWidth: 540, width: "100%", maxHeight: "88vh", display: "flex", flexDirection: "column", boxShadow: "0 24px 60px rgba(20,40,20,0.25)", overflow: "hidden" }}>
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(20,28,18,0.55)", zIndex: 40, display: "flex", alignItems: "center", justifyContent: "center", padding: "calc(16px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom))" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: "#fff", borderRadius: 18, maxWidth: 540, width: "100%", maxHeight: "88dvh", display: "flex", flexDirection: "column", boxShadow: "0 24px 60px rgba(20,40,20,0.25)", overflow: "hidden" }}>
         <div style={{ padding: "20px 22px 14px", borderBottom: "1px solid #EEF1E9" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
             <h2 style={{ fontFamily: "'Fraunces', serif", fontSize: 21, margin: 0, color: "#22301F" }}>{CAT_ICONS[cat]} Wybierz: {cat.toLowerCase()}</h2>
@@ -145,8 +145,8 @@ function RecipeModal({ recipe, onClose }) {
     .map(l => l.replace(/^\s*\d+[.)]\s*/, "").trim())
     .filter(Boolean);
   return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(20,28,18,0.55)", zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
-      <div onClick={e => e.stopPropagation()} style={{ background: "#fff", borderRadius: 18, maxWidth: 560, width: "100%", maxHeight: "85vh", overflowY: "auto", padding: "26px 26px 30px", boxShadow: "0 24px 60px rgba(20,40,20,0.25)" }}>
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(20,28,18,0.55)", zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: "calc(16px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom))" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: "#fff", borderRadius: 18, maxWidth: 560, width: "100%", maxHeight: "85dvh", overflowY: "auto", padding: "26px 26px 30px", boxShadow: "0 24px 60px rgba(20,40,20,0.25)" }}>
         <img key={recipe.id} src={recipe.img || `recipes/${recipe.id}.jpg`} alt={recipe.name}
           onError={e => { e.target.style.display = "none"; }}
           style={{ width: "calc(100% + 52px)", margin: "-26px -26px 18px", height: 220, objectFit: "cover", borderRadius: "18px 18px 0 0", display: "block" }} />
@@ -285,6 +285,15 @@ export default function App({ session }) {
     syncColumn(user.id, "goals", goals);
   }, [goals, loaded, user.id]);
 
+  // Locks background scroll while a modal is open. Without this, focusing the search
+  // input on iOS scrolls the underlying page along with the "fixed" overlay (a WebKit
+  // quirk), which reveals the app header above the modal.
+  useEffect(() => {
+    const isOpen = !!(picker || modal);
+    document.body.style.overflow = isOpen ? "hidden" : "";
+    return () => { document.body.style.overflow = ""; };
+  }, [picker, modal]);
+
   const targetFor = k => goals.days[k] || goals.global;
 
   const setDayGoal = t => setGoals(g => {
@@ -420,14 +429,14 @@ export default function App({ session }) {
   const selectStyle = { width: "100%", padding: "9px 10px", borderRadius: 10, border: "1.5px solid #DDE3D5", background: "#fff", fontSize: 13.5, color: "#22301F", fontFamily: "inherit" };
 
   return (
-    <div style={{ minHeight: "100vh", background: "#F7F9F3", fontFamily: "'Work Sans', system-ui, sans-serif", color: "#22301F" }}>
+    <div style={{ minHeight: "100dvh", background: "#F7F9F3", fontFamily: "'Work Sans', system-ui, sans-serif", color: "#22301F" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Work+Sans:wght@400;500;600;700&display=swap');
         select:focus, input:focus, button:focus-visible { outline: 2px solid #3D7A46; outline-offset: 1px; }
         button { font-family: inherit; }
       `}</style>
 
-      <header style={{ background: "#22301F", color: "#F3F6EC", padding: "18px 20px 0" }}>
+      <header style={{ background: "#22301F", color: "#F3F6EC", padding: "calc(18px + env(safe-area-inset-top)) 20px 0" }}>
         <div style={{ maxWidth: 1060, margin: "0 auto" }}>
           <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap", justifyContent: "space-between" }}>
             <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
@@ -452,7 +461,7 @@ export default function App({ session }) {
         </div>
       </header>
 
-      <main style={{ maxWidth: 1060, margin: "0 auto", padding: "22px 16px 60px" }}>
+      <main style={{ maxWidth: 1060, margin: "0 auto", padding: "22px 16px calc(60px + env(safe-area-inset-bottom))" }}>
         {!loaded && <div style={{ color: "#7A836F", fontSize: 14 }}>Wczytywanie planu…</div>}
 
         {tab === "cal" && loaded && (

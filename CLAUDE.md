@@ -63,8 +63,23 @@ schema above, then replace the files — there is no build script that does this
 
 `RecipeThumb`/`RecipeModal` in `App.jsx` resolve an image as `r.img || \`recipes/${r.id}.jpg\``, i.e.
 falling back to a local file at `public/recipes/<id>.jpg`. On load error they silently swap to a
-colored category-icon placeholder (`onError` handler). `public/recipes/` currently exists but is
-empty — no recipe has a photo yet, so every recipe renders its icon placeholder.
+colored category-icon placeholder (`onError` handler). No recipe sets an explicit `img` — every
+recipe photo lives at `public/recipes/<id>.jpg` and is sourced from the Pexels API via two scripts
+in `scripts/`, run in order whenever `recipes.js` is regenerated:
+
+1. `generate-photo-queries.mjs` — classifies each recipe's Polish `name` against an ordered list of
+   regexes to produce a short English search query (e.g. "oatmeal bowl with fruit"), writing one row
+   per recipe to `photo-queries.csv` (gitignored). Recipes with no matching rule fall back to
+   `"polish home cooked meal"`.
+2. `fetch-recipe-photos.mjs` — reads `photo-queries.csv`, does one Pexels search per *unique* query
+   (many recipes share a query, e.g. several oatmeal variants), then round-robins a distinct photo
+   from that query's result pool to each recipe using it, downloading to `public/recipes/<id>.jpg`.
+   This is what gives every recipe its own photo file rather than several recipes sharing one image.
+   Requires `PEXELS_API_KEY` in `.env.local`. Writes `photo-credits.json` (gitignored) with the
+   photographer/source URL used per recipe id, for attribution reference.
+
+There is no per-category/per-dish-type shared image — each recipe id always has (or is meant to
+have) its own downloaded `.jpg`.
 
 ### State and persistence
 

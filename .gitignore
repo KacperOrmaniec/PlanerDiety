@@ -5,6 +5,5 @@ Thumbs.db
 .claude/settings.local.json
 .env.local
 photo-prompts.csv
-photo-groups.csv
-photo-group-queries.csv
-photo-group-credits.json
+photo-queries.csv
+photo-credits.json
