@@ -20,12 +20,13 @@ npm run preview  # serve the dist/ build locally to sanity-check before deployin
 
 There is no lint or test setup in this repo (no ESLint config, no test runner). The closest thing to
 verification is `npm run build` succeeding and manually exercising the app in a browser. The build
-currently emits one ~713 kB JS chunk (~188 kB gzip) and warns about the 500 kB chunk limit — that
+currently emits one ~724 kB JS chunk (~191 kB gzip) and warns about the 500 kB chunk limit — that
 warning is expected, not a regression (see "Known issues").
 
 Requires a `.env.local` (gitignored, see `.env.example`) with `VITE_SUPABASE_URL` and
 `VITE_SUPABASE_ANON_KEY` for a Supabase project that has run `supabase/schema.sql` — which now
-creates the `plans` table, the `progress` table and the private `progress-photos` storage bucket,
+creates the `plans` table (including its `extras` column), the `progress` table and the private
+`progress-photos` storage bucket,
 and is safe to re-run (every statement is guarded). Without them the
 app does not crash: `supabaseClient.js` exports `supabaseConfigured = false` (and `supabase = null`),
 and `Root.jsx` renders a Polish "Brak konfiguracji Supabase" card instead of the auth screen.
@@ -36,12 +37,14 @@ bundled).
 
 **The app is three tabs across three files**, with no router, no component library and no CSS files:
 
-- `src/App.jsx` (~950 lines) — the shell (header, tab switch) plus the two meal-planning tabs:
-  calendar grid, day panel, `PickerModal`, `RecipeModal`, shopping list, and the Supabase sync layer.
-- `src/Progress.jsx` (~700 lines) — the "Postępy" tab in full (see below). Split out rather than
+- `src/App.jsx` (~1330 lines) — the shell (header, tab switch) plus the two meal-planning tabs:
+  calendar grid, day panel, `PickerModal`, `RecipeModal`, `QuickEntryModal`, shopping list, and the
+  Supabase sync layer.
+- `src/Progress.jsx` (~830 lines) — the "Postępy" tab in full (see below). Split out rather than
   bolted onto `App.jsx` purely for size; it follows the same conventions.
-- `src/ui.jsx` — the design tokens, date helpers and shared pieces both import. Anything used by
-  more than one tab belongs here.
+- `src/ui.jsx` — the design tokens, date helpers and the pieces both tabs import: `Segmented`,
+  `SwipeRow`, `UndoToast`, `Icon` with its `P_*` paths, and the number/plural formatters. Anything
+  used by more than one tab belongs here.
 
 Styling is inline `style={}` objects throughout, on a calm iOS-flavoured system defined as constants
 in `src/ui.jsx`. Match it rather than introducing a CSS/styling system:
@@ -170,6 +173,8 @@ separate `localStorage` keys:
 - `plan` — the meal plan: `{ [dateKey]: { [category]: recipeId } }`
 - `eaten` — which planned meals are checked off as eaten: `{ [dateKey]: { [category]: true } }`
 - `goals` — calorie goals (`{ global, days: { [dateKey]: target } }`)
+- `extras` — ad-hoc food logged straight into a day (see "Quick entries" below):
+  `{ [dateKey]: [ { id, name, kcal, p, f, c, cat } ] }`
 
 `dateKey` is zero-padded `YYYY-MM-DD` (see `keyOf`, `App.jsx:33`) — the same format
 `<input type="date">` uses, which is why the shopping-list range inputs can bind to it directly and
@@ -246,9 +251,24 @@ zero — a weight-only entry adds a point to the weight chart and none to the ot
 JPEG) and uploaded to the **private** `progress-photos` bucket at
 `<user_id>/<entry_id>/<slot>.jpg`, with the thumbnail alongside as `<slot>_thumb.jpg`; only the path
 is stored in the row. The first path segment being the owner is what the storage RLS policies match
-against `auth.uid()`. Being private, every image needs a short-lived signed URL —
-`createSignedUrls` is batched once per load and cached in state, and a save invalidates the URLs for
-any replaced photo. Uploads happen on save, not on selection, so cancelling an edit never leaves
+against `auth.uid()`. Being private, every image needs a short-lived signed URL.
+`createSignedUrls` is batched, and **which paths have been asked for is tracked in a `requested` ref,
+never derived from the `urls` state**. That distinction is the whole point: an earlier version
+computed the pending set as "paths not in `urls`" and listed `urls` as an effect dependency, so a
+path that could not be signed — a file gone from storage, or the bucket policies from
+`supabase/schema.sql` never applied — stayed pending forever and the effect re-fired on every one of
+its own updates, hammering storage for as long as the tab was open. Each path is now attempted once
+per mount; a per-object failure stays claimed (it is broken, not pending, and `SafeImg` renders a
+placeholder), while a failure of the whole call is un-claimed so a later change to `entries` can try
+again — never a timer. Saving an entry clears both the stale URL and the claim for its photos, so a
+replaced file gets signed again.
+
+An image that still fails to load — an expired signature (they last an hour), or an object that has
+gone — calls `renewUrl` through `SafeImg`'s `onFail`, which drops the URL and asks for one fresh
+signature. `renewed` caps that at a single attempt per path, so a genuinely broken file settles on
+the placeholder instead of restarting the loop. Note `onFail` reports the *src* that failed, so
+callers pass the storage path explicitly (`onFail={() => renewUrl(thumbPath)}`) — handing it
+`renewUrl` directly keys the caches by URL and silently renews nothing. Uploads happen on save, not on selection, so cancelling an edit never leaves
 orphan files; deleting an entry removes its files too.
 
 Numbers are entered Polish-style: `parseNum` accepts a comma or a dot, `fmtNum` always renders a
@@ -259,6 +279,58 @@ a failure surfaces as an error in the editor with the form still filled, rather 
 deliberately simpler than the `plans` sync layer, and nothing is lost because the user's input stays
 on screen. If `public.progress` is missing entirely, the tab says so and points at
 `supabase/schema.sql`.
+
+### Quick entries ("szybki wpis")
+
+Food eaten outside the plan, logged in a couple of taps. The point of the feature is what it is
+**not**: it never enters the recipe catalogue. `RECIPES` is a build artifact generated from the
+spreadsheet, so an ad-hoc entry has no business in it — it would also come back as a search result
+in `PickerModal` forever after. Each entry is therefore self-contained (its own name and numbers, no
+recipe id) and lives in the `extras` column, not in `plan`.
+
+Consequences worth knowing before touching this:
+
+- **It counts everywhere the plan counts.** `dayTotals` adds `quickTotals(extras[dateKey])` to the
+  kcal and macro sums and returns it as `totals.quick`; the day panel's "Zjedzone" counter includes
+  ad-hoc entries unconditionally (they are logged after the fact, so they are eaten by definition);
+  `PickerModal`'s remaining-budget strip counts them in `others`; and a calendar cell lights the dot
+  for an entry's category, plus a grey dot for entries with no category.
+- **"Wylosuj dzień" draws against what is left.** `drawTarget = targetFor(day) − quick kcal`, and
+  the button names that number rather than the day's goal. A four-meal draw can never total less
+  than `MIN_DAY` (2256 kcal, straight out of `SUMS[0].min`), so a large quick entry can put the
+  remaining target out of reach — the panel says so instead of silently overshooting.
+- **The form is deliberately half of "add a recipe".** Name (defaults to "Szybki wpis" when blank),
+  kcal (the only hard requirement, validated), macros behind a collapsed section, optional meal
+  category. No search, no units, no per-100 g maths, no date picker — it lands on the day currently
+  selected in the calendar, which is also how you log something for a past day.
+- Entries are editable and deletable from the "Dodatkowo" list; a "ręczny" tag marks them apart from
+  planned meals, which otherwise use the same row styling.
+
+Shopping lists ignore `extras` entirely — ad-hoc food has no ingredient breakdown to buy.
+
+### Removing a meal from a day
+
+Every row in the day panel — the four planned slots and each ad-hoc entry — is wrapped in
+`SwipeRow` (`ui.jsx`): drag it left to reveal a red delete action, the iOS pattern this is meant to
+become natively. Three things about it are deliberate:
+
+- **Gesture-first, never gesture-only.** The revealed action is a real focusable `<button>` with an
+  `aria-label`, and focusing it slides its row open, so Tab reaches deletion on every row. The older
+  paths (the picker's "Usuń posiłek z tego dnia", the quick sheet's "Usuń wpis") still work and are
+  untouched. An empty slot renders no action at all (`disabled`), so there is nothing to delete.
+- **The sliding layer must be opaque** (`background`, default `CARD`, `GREEN_SOFT` for a row marked
+  eaten). It sits on top of the red action; leave it transparent and every row shows a permanent red
+  stripe. Vertical drags are handed back to the browser (`touch-action: pan-y` plus an axis check on
+  the first few pixels), so the gesture never fights page scrolling.
+- **Undo, not confirm.** Deleting is frequent and cheap, so a dialog in front of each one gets old;
+  the row collapses (a ~200 ms transition, then the state change commits) and an `UndoToast` offers
+  one tap to put it back for 6 seconds. Undo restores exactly what was removed — a planned meal
+  comes back with its `eaten` flag, an ad-hoc entry at its original index in the day's array.
+
+Deleting only ever removes the day's entry. `RECIPES` is a static catalogue the app never writes to,
+so a planned meal's recipe is untouched and remains findable in the picker; the other meals of the
+day are likewise unaffected, and `dayTotals` recomputes from state so kcal and macros update in the
+same render.
 
 ### PWA
 
@@ -294,6 +366,19 @@ does not mention Supabase, auth, or the required env vars. Prefer this file.
 Verified against the code. The data-loss and correctness groups are fixed; performance and the
 minor items are open. Do not "rediscover" any of it as new bugs.
 
+**Photo previews, fast deletes, expired signatures — fixed**
+Three defects found in the audit after the redesign: the entry editor revoked the *previous* set of
+preview blobs on every change (so adding a second photo killed the first one's preview); deleting two
+rows within the 200 ms collapse cancelled the first delete instead of landing it; and a signed URL
+that had expired left a dead `<img>` with no way back. Fixed by an unmount-only preview cleanup, a
+`pendingRemoval` ref that flushes rather than cancels, and the one-shot `renewUrl` path above.
+
+**Storage request loop — fixed**
+Opening "Postępy" with a photo that could not be signed used to re-request signed URLs endlessly
+(38 000 calls in seconds in a harness; bounded only by network latency against real Supabase). Fixed
+by the `requested` ref described under "Progress tracking" — do not reintroduce `urls` as a
+dependency of that effect.
+
 **Data loss — fixed, see "State and persistence"**
 The four ways an edit could be lost (empty-state overwrite after a failed load, `update` silently
 matching no row, the retry queue dropping a value on a non-network error, and no sign that any of it
@@ -320,7 +405,7 @@ tolerance widens from 50 kcal only when nothing fits, so out-of-range goals stil
 Drawing across all five diets is deliberate — see the comment above `POOLS`.
 
 **Performance**
-- Single ~713 kB bundle: `recipes.js` + `instructions.js` (~330 kB) load eagerly even though `STEPS`
+- Single ~724 kB bundle: `recipes.js` + `instructions.js` (~330 kB) load eagerly even though `STEPS`
   is only needed inside `RecipeModal`.
 - `public/recipes/` is ~23 MB of unresized Pexels JPEGs (largest 942 kB) served into 46–58 px
   thumbnails and a 200 px hero. Combined with the SW's network-first policy, these immutable images

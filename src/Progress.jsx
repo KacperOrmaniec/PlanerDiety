@@ -1,9 +1,9 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { supabase } from "./lib/supabaseClient.js";
 import {
-  GREEN, GREEN_DEEP, GREEN_SOFT, BG, CARD, INK, INK_SOFT, MUTED, LINE, FILL,
-  AMBER, AMBER_SOFT, AMBER_DEEP, RED, RED_SOFT, RED_DEEP, BLUE, TEAL, PINK,
-  R_CTRL, R_PILL, SHADOW_SM, NUM, keyOf, fmtPL, fmtShort, dateOf, plural,
+  GREEN, GREEN_DEEP, GREEN_SOFT, CARD, INK, INK_SOFT, MUTED, LINE, FILL,
+  AMBER, RED, RED_SOFT, RED_DEEP, BLUE, TEAL, PINK,
+  R_CTRL, R_PILL, SHADOW_SM, NUM, keyOf, fmtPL, fmtShort, dateOf, plural, fmtNum, parseNum,
   caption, sectionLabel, cardStyle, listBox, iconBtn, pillBtn, primaryBtn, fieldStyle,
   overlay, sheet, Segmented, SafeImg,
   P_CHEVRON, P_CLOSE, P_PLUS, P_CAMERA, P_TRASH, P_SHARE, P_EDIT,
@@ -35,14 +35,6 @@ const SLOTS = [["photo_front", "Przód"], ["photo_side", "Bok"], ["photo_back", 
 const RANGES = [["1m", "1 mies."], ["3m", "3 mies."], ["6m", "6 mies."], ["1y", "Rok"], ["all", "Całość"]];
 const RANGE_DAYS = { "1m": 31, "3m": 92, "6m": 183, "1y": 366 };
 
-// Polish writes decimals with a comma; accept either on input, always show a comma.
-const fmtNum = v => (v === null || v === undefined || v === "" ? "—" : String(Math.round(v * 10) / 10).replace(".", ","));
-const parseNum = raw => {
-  const t = String(raw).trim().replace(",", ".");
-  if (!t) return null;
-  const n = Number(t);
-  return Number.isFinite(n) ? n : NaN;
-};
 const thumbOf = path => path && path.replace(/\.jpg$/, "_thumb.jpg");
 
 // Downscale before upload: phone photos are several MB and are shown at most a few hundred px.
@@ -241,7 +233,9 @@ function EntryEditor({ user, entry, taken, urls, onSaved, onDeleted, onClose }) 
   const [error, setError] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
 
-  useEffect(() => () => Object.values(previews).forEach(URL.revokeObjectURL), [previews]);
+  const livePreviews = useRef({});
+  useEffect(() => { livePreviews.current = previews; }, [previews]);
+  useEffect(() => () => Object.values(livePreviews.current).forEach(URL.revokeObjectURL), []);
 
   const photoUrl = slot => {
     if (previews[slot]) return previews[slot];
@@ -415,7 +409,7 @@ function EntryEditor({ user, entry, taken, urls, onSaved, onDeleted, onClose }) 
 }
 
 // --- Comparison ----------------------------------------------------------
-function Compare({ entries, urls }) {
+function Compare({ entries, urls, onRenew }) {
   const withPhotos = entries;
   const [fromId, setFromId] = useState(() => (withPhotos.length ? withPhotos[withPhotos.length - 1].id : ""));
   const [toId, setToId] = useState(() => (withPhotos.length ? withPhotos[0].id : ""));
@@ -566,7 +560,7 @@ function Compare({ entries, urls }) {
                 {[a, b].map((entry, i) => (
                   <div key={i} style={{ flex: 1 }}>
                     <div style={{ aspectRatio: "3 / 4", borderRadius: R_CTRL, overflow: "hidden", background: FILL, border: `1px solid ${LINE}` }}>
-                      <SafeImg src={urls[entry[slot]]} alt={`${label} ${fmtPL(entry.date)}`}
+                      <SafeImg src={urls[entry[slot]]} onFail={() => onRenew(entry[slot])} alt={`${label} ${fmtPL(entry.date)}`}
                         style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
                         fallback={<div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center",
                           justifyContent: "center", color: MUTED, fontSize: 12 }}>Brak zdjęcia</div>} />
@@ -630,22 +624,47 @@ export default function Progress({ user }) {
   useEffect(() => { load(); }, [load]);
 
   // Photos live in a private bucket, so every path needs a signed URL before it can be shown.
+  //
+  // What counts as "already handled" is tracked here, in a ref, and NOT derived from `urls`. Deriving
+  // it from `urls` and listing `urls` as a dependency is what used to spin: a path that cannot be
+  // signed (file gone from storage, or the bucket policies from supabase/schema.sql never applied)
+  // never lands in `urls`, so it stayed "missing", the effect re-ran, and it asked again - for as
+  // long as the tab was open. Each path is now attempted exactly once per mount.
+  const requested = useRef(new Set());
+  const renewed = useRef(new Set());
+  const [renewTick, setRenewTick] = useState(0);
+
+  // Called by an <img> that could not load: drop the stale URL and let the effect sign it again.
+  const renewUrl = useCallback(path => {
+    if (!path || renewed.current.has(path)) return;   // one renewal per path, then it stays broken
+    renewed.current.add(path);
+    requested.current.delete(path);
+    setUrls(u => { const next = { ...u }; delete next[path]; return next; });
+    setRenewTick(t => t + 1);
+  }, []);
+
   useEffect(() => {
     const paths = [];
     for (const e of entries) for (const [slot] of SLOTS) if (e[slot]) paths.push(e[slot], thumbOf(e[slot]));
-    const missing = paths.filter(p => !urls[p]);
+    const missing = paths.filter(p => !requested.current.has(p));
     if (!missing.length) return;
-    let cancelled = false;
+    missing.forEach(p => requested.current.add(p));   // claim them before awaiting, so a re-render
+                                                      // during the request cannot ask a second time
     supabase.storage.from(BUCKET).createSignedUrls(missing, 3600).then(({ data, error: sErr }) => {
-      if (cancelled || sErr || !data) { if (sErr) console.error(sErr); return; }
-      setUrls(u => {
-        const next = { ...u };
-        data.forEach(d => { if (d.signedUrl && !d.error) next[d.path] = d.signedUrl; });
-        return next;
-      });
+      if (sErr || !data) {
+        // The whole call failed rather than individual objects: let a later change to `entries`
+        // have another go, but never retry on a timer.
+        console.error(sErr || "Nie udało się podpisać adresów zdjęć.");
+        missing.forEach(p => requested.current.delete(p));
+        return;
+      }
+      const signed = {};
+      data.forEach(d => { if (d.signedUrl && !d.error) signed[d.path] = d.signedUrl; });
+      // Paths that came back with a per-object error stay claimed: they are broken, not pending,
+      // and SafeImg already renders a placeholder for them.
+      if (Object.keys(signed).length) setUrls(u => ({ ...u, ...signed }));
     });
-    return () => { cancelled = true; };
-  }, [entries, urls]);
+  }, [entries, renewTick]);
 
   const latest = entries[0];
   const previous = entries[1];
@@ -665,7 +684,13 @@ export default function Progress({ user }) {
 
   const onSaved = saved => {
     setEntries(list => [...list.filter(e => e.id !== saved.id), saved].sort((a, b) => (a.date < b.date ? 1 : -1)));
-    setUrls(u => {                                        // drop stale signed URLs for replaced photos
+    // A replaced photo reuses its path, so both the stale URL and the "already asked" mark have to
+    // go, otherwise the new file would never be signed.
+    for (const [slot] of SLOTS) if (saved[slot]) {
+      requested.current.delete(saved[slot]);
+      requested.current.delete(thumbOf(saved[slot]));
+    }
+    setUrls(u => {
       const next = { ...u };
       for (const [slot] of SLOTS) if (saved[slot]) { delete next[saved[slot]]; delete next[thumbOf(saved[slot])]; }
       return next;
@@ -764,7 +789,9 @@ export default function Progress({ user }) {
             Historia · {entries.length} {plural(entries.length, "wpis", "wpisy", "wpisów")}
           </div>
           <ul style={{ ...listBox, listStyle: "none", padding: 0, margin: 0, background: CARD }}>
-            {entries.map((e, i) => (
+            {entries.map((e, i) => {
+              const thumbPath = thumbOf([e.photo_front, e.photo_side, e.photo_back].filter(Boolean)[0]);
+              return (
               <li key={e.id} style={{ borderTop: i ? `1px solid ${LINE}` : "none" }}>
                 <button onClick={() => setEditing(e)} className="press row" style={{
                   width: "100%", display: "flex", alignItems: "center", gap: 12, textAlign: "left",
@@ -772,7 +799,7 @@ export default function Progress({ user }) {
                 }}>
                   <div style={{ width: 48, height: 60, borderRadius: 10, overflow: "hidden", background: FILL,
                     flexShrink: 0, border: `1px solid ${LINE}` }}>
-                    <SafeImg src={urls[thumbOf(e.photo_front)] || urls[thumbOf(e.photo_side)] || urls[thumbOf(e.photo_back)]}
+                    <SafeImg src={urls[thumbPath]} onFail={() => renewUrl(thumbPath)}
                       alt="" loading="lazy" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
                       fallback={<div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center",
                         justifyContent: "center", color: MUTED }}><Icon d={P_CAMERA} size={16} color={MUTED} /></div>} />
@@ -784,7 +811,8 @@ export default function Progress({ user }) {
                   <Icon d={P_CHEVRON} size={18} color={MUTED} />
                 </button>
               </li>
-            ))}
+              );
+            })}
           </ul>
         </>
       ) : view === "charts" ? (
@@ -812,7 +840,7 @@ export default function Progress({ user }) {
           )}
         </section>
       ) : (
-        <section style={cardStyle}><Compare entries={entries} urls={urls} /></section>
+        <section style={cardStyle}><Compare entries={entries} urls={urls} onRenew={renewUrl} /></section>
       )}
 
       {entries.length > 0 && (

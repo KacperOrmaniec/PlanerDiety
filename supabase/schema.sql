@@ -18,6 +18,11 @@ create table if not exists public.plans (
   updated_at timestamptz not null default now()
 );
 
+-- Ad-hoc food logged straight into a day ("szybki wpis"): self-contained entries that count
+-- towards the day's totals but never enter the recipe catalogue, which is a static build artifact.
+-- Shape: { "<YYYY-MM-DD>": [ { id, name, kcal, p, f, c, cat } ] } - cat is optional.
+alter table public.plans add column if not exists extras jsonb not null default '{}'::jsonb;
+
 alter table public.plans enable row level security;
 
 drop policy if exists "select own plan" on public.plans;

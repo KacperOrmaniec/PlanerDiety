@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 
 // --- Design tokens -------------------------------------------------------
 // Calm iOS-flavoured surface: near-white app background, white cards with soft shadows and
@@ -44,6 +44,15 @@ export const fmtShort = k => { const [, m, d] = k.split("-"); return `${parseInt
 export const dowOf = k => { const [y,m,d] = k.split("-").map(Number); return DOW_LONG[(new Date(y, m-1, d).getDay() + 6) % 7]; };
 // Local noon keeps the date stable across DST shifts.
 export const dateOf = k => new Date(k + "T12:00:00");
+
+// Polish writes decimals with a comma; accept either on input, always render a comma.
+export const fmtNum = v => (v === null || v === undefined || v === "" ? "—" : String(Math.round(v * 10) / 10).replace(".", ","));
+export const parseNum = raw => {
+  const t = String(raw).trim().replace(",", ".");
+  if (!t) return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : NaN;
+};
 
 // Polish counts decline three ways: 1 dzień, 2-4 dni, 5 dni - and the teens fall back to "many".
 export const plural = (n, one, few, many) => {
@@ -125,8 +134,108 @@ export const Icon = ({ d, size = 16, color = "currentColor", stroke = 1.9 }) => 
 );
 
 // --- Image that falls back to a tinted placeholder ----------------------
-export function SafeImg({ src, alt = "", style, fallback = null, ...rest }) {
-  const [err, setErr] = useState(false);
+export function SafeImg({ src, alt = "", style, fallback = null, onFail, ...rest }) {
+  const [failed, setFailed] = useState(null);
+  const err = failed === src;                   // a new src gets a fresh chance on its own
   if (!src || err) return fallback;
-  return <img src={src} alt={alt} onError={() => setErr(true)} style={style} {...rest} />;
+  return <img src={src} alt={alt} style={style}
+    onError={() => { setFailed(src); if (onFail) onFail(src); }} {...rest} />;
+}
+
+// Swipe-to-delete on a list row, the iOS way: drag left to reveal a red action behind the row.
+// Deliberately gesture-first but never gesture-only — the action is a real focusable <button>, so
+// Tab reaches it (and focusing slides the row open), and the existing delete buttons inside the
+// picker and the quick-entry sheet keep working untouched.
+const SWIPE_W = 88;
+
+export function SwipeRow({ children, onDelete, label = "Usuń", disabled = false, collapsing = false, background = CARD }) {
+  const [offset, setOffset] = useState(0);   // current x translation, -SWIPE_W when fully open
+  const [open, setOpen] = useState(false);
+  const drag = useRef(null);
+  const dragged = useRef(false);
+
+  const settle = next => { setOpen(next); setOffset(next ? -SWIPE_W : 0); };
+
+  const onPointerDown = e => {
+    if (disabled || (e.pointerType === "mouse" && e.button !== 0)) return;
+    drag.current = { x: e.clientX, y: e.clientY, axis: null, base: open ? -SWIPE_W : 0 };
+    dragged.current = false;
+  };
+
+  const onPointerMove = e => {
+    const d = drag.current;
+    if (!d) return;
+    const dx = e.clientX - d.x, dy = e.clientY - d.y;
+    if (!d.axis) {
+      if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return;
+      // Let the browser keep vertical scrolling; only take over on a clearly horizontal drag.
+      d.axis = Math.abs(dx) > Math.abs(dy) ? "x" : "y";
+      if (d.axis === "x") e.currentTarget.setPointerCapture(e.pointerId);
+    }
+    if (d.axis !== "x") return;
+    dragged.current = true;
+    setOffset(Math.max(-SWIPE_W, Math.min(0, d.base + dx)));
+  };
+
+  const endDrag = () => {
+    const d = drag.current;
+    drag.current = null;
+    if (!d || d.axis !== "x") return;
+    settle(offset < -SWIPE_W / 2);
+  };
+
+  return (
+    <div style={{
+      position: "relative", overflow: "hidden",
+      maxHeight: collapsing ? 0 : 400, opacity: collapsing ? 0 : 1,
+      transition: collapsing ? "max-height .22s ease, opacity .16s ease" : "none"
+    }}>
+      <button type="button" onClick={() => { settle(false); onDelete(); }} onFocus={() => settle(true)}
+        disabled={disabled} aria-label={label}
+        style={{
+          position: "absolute", top: 0, right: 0, bottom: 0, width: SWIPE_W, border: "none",
+          background: RED, color: "#fff", cursor: "pointer", display: disabled ? "none" : "flex",
+          flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4,
+          fontSize: 12, fontWeight: 600
+        }}>
+        <Icon d={P_TRASH} size={17} color="#fff" />
+        {label}
+      </button>
+      <div
+        onPointerDown={onPointerDown} onPointerMove={onPointerMove}
+        onPointerUp={endDrag} onPointerCancel={endDrag}
+        onClickCapture={e => { if (dragged.current) { e.preventDefault(); e.stopPropagation(); dragged.current = false; } }}
+        style={{
+          position: "relative", background, touchAction: "pan-y",
+          transform: `translateX(${offset}px)`,
+          transition: drag.current ? "none" : "transform .2s cubic-bezier(.2,.8,.3,1)"
+        }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// A short-lived "undone in one tap" bar. Preferred over a confirmation dialog: deleting a meal is
+// a frequent, cheap action, and a modal in front of every one of them gets old fast.
+export function UndoToast({ message, onUndo, onDismiss }) {
+  useEffect(() => {
+    const id = setTimeout(onDismiss, 6000);
+    return () => clearTimeout(id);
+  }, [message, onDismiss]);
+  return (
+    <div role="status" style={{
+      position: "fixed", left: "50%", transform: "translateX(-50%)",
+      bottom: "calc(20px + env(safe-area-inset-bottom))", zIndex: 60,
+      display: "flex", alignItems: "center", gap: 14, maxWidth: "calc(100vw - 32px)",
+      background: INK, color: "#fff", borderRadius: R_PILL, padding: "11px 12px 11px 18px",
+      boxShadow: "0 12px 32px rgba(16,24,40,.28)", fontSize: 14, fontWeight: 500
+    }}>
+      <span className="ellip">{message}</span>
+      <button onClick={onUndo} className="press" style={{
+        border: "none", background: "rgba(255,255,255,.16)", color: "#fff", borderRadius: R_PILL,
+        padding: "6px 14px", fontSize: 13.5, fontWeight: 600, cursor: "pointer", flexShrink: 0
+      }}>Cofnij</button>
+    </div>
+  );
 }

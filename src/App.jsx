@@ -7,9 +7,11 @@ import { supabase } from "./lib/supabaseClient.js";
 import {
   FONT, GREEN, GREEN_DEEP, GREEN_SOFT, GREEN_GLOW, BG, CARD, INK, INK_SOFT, MUTED, LINE, FILL,
   AMBER, AMBER_SOFT, AMBER_DEEP, RED, RED_SOFT, RED_DEEP, R_CARD, R_CTRL, R_PILL, SHADOW_SM, NUM,
-  MONTHS, DOW, pad, keyOf, fmtPL, dowOf, plural,
-  caption, sectionLabel, cardStyle, listBox, iconBtn, pillBtn, overlay, sheet, Segmented,
-  P_CHEVRON, P_BACK, P_CLOSE, P_CHECK, P_PLUS, P_SEARCH, Icon,
+  MONTHS, DOW, keyOf, fmtPL, dowOf, plural,
+  caption, sectionLabel, cardStyle, listBox, iconBtn, pillBtn, primaryBtn, fieldStyle, overlay, sheet, Segmented,
+  SwipeRow, UndoToast,
+  fmtNum, parseNum,
+  P_CHEVRON, P_BACK, P_CLOSE, P_CHECK, P_PLUS, P_SEARCH, P_EDIT, P_TRASH, Icon,
 } from "./ui.jsx";
 import Progress from "./Progress.jsx";
 
@@ -110,6 +112,10 @@ function waysWithin(i, rem, tol) {
   hi = Number.isFinite(hi) ? Math.min(s.counts.length - 1, hi) : s.counts.length - 1;
   return hi < lo ? 0 : s.pre[hi + 1] - s.pre[lo];
 }
+
+// A drawn day is always four meals, so its total can never leave this span.
+const MIN_DAY = SUMS[0].min;
+const MAX_DAY = SUMS[0].min + SUMS[0].counts.length - 1;
 
 function drawDay(goal) {
   const tol = TOLERANCES.find(t => waysWithin(0, goal, t) > 0); // widened only if nothing fits
@@ -361,6 +367,139 @@ function RecipeModal({ recipe, onClose }) {
   );
 }
 
+// A "szybki wpis": food eaten outside the plan, logged straight into a day. It is deliberately
+// NOT a recipe - RECIPES is a build artifact generated from the spreadsheet, and an ad-hoc entry
+// has no business in it. Each entry carries its own numbers, so nothing here references the
+// catalogue and nothing here can be searched for or reused from the picker.
+const QUICK_MAX_KCAL = 5000;
+
+function quickTotals(list) {
+  return (list || []).reduce((t, e) => ({
+    kcal: t.kcal + (e.kcal || 0), p: t.p + (e.p || 0), f: t.f + (e.f || 0), c: t.c + (e.c || 0), n: t.n + 1,
+  }), { kcal: 0, p: 0, f: 0, c: 0, n: 0 });
+}
+
+function QuickEntryModal({ entry, dayLabel, onSave, onDelete, onClose }) {
+  const isNew = !entry.id;
+  const [name, setName] = useState(entry.name || "");
+  const [kcal, setKcal] = useState(entry.kcal === undefined || entry.kcal === null ? "" : fmtNum(entry.kcal));
+  const [p, setP] = useState(entry.p === undefined || entry.p === null ? "" : fmtNum(entry.p));
+  const [c, setC] = useState(entry.c === undefined || entry.c === null ? "" : fmtNum(entry.c));
+  const [f, setF] = useState(entry.f === undefined || entry.f === null ? "" : fmtNum(entry.f));
+  const [cat, setCat] = useState(entry.cat || "");
+  const [macros, setMacros] = useState([entry.p, entry.c, entry.f].some(v => v !== undefined && v !== null));
+  const [error, setError] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  const submit = e => {
+    e.preventDefault();
+    const kc = parseNum(kcal);
+    if (kc === null || Number.isNaN(kc)) { setError("Podaj kalorie — to jedyne wymagane pole."); return; }
+    if (kc <= 0 || kc > QUICK_MAX_KCAL) { setError(`Kalorie poza sensownym zakresem (0–${QUICK_MAX_KCAL} kcal).`); return; }
+
+    const macro = {};
+    for (const [key, raw, label] of [["p", p, "Białko"], ["c", c, "Węglowodany"], ["f", f, "Tłuszcze"]]) {
+      const n = parseNum(raw);
+      if (Number.isNaN(n)) { setError(`Nieprawidłowa liczba w polu „${label}”.`); return; }
+      if (n !== null && (n < 0 || n > 1000)) { setError(`„${label}” poza sensownym zakresem.`); return; }
+      macro[key] = n;
+    }
+
+    onSave({
+      id: entry.id || crypto.randomUUID(),
+      name: name.trim() || "Szybki wpis",
+      kcal: Math.round(kc),
+      ...macro,
+      cat: cat || null,
+    });
+  };
+
+  const numField = (label, value, setValue, autoFocus) => (
+    <div style={{ flex: "1 1 30%", minWidth: 90 }}>
+      <label style={{ ...caption(), display: "block", marginBottom: 6 }}>{label} <span style={{ color: MUTED }}>(g)</span></label>
+      <input inputMode="decimal" value={value} placeholder="—" autoFocus={autoFocus}
+        onChange={e => setValue(e.target.value)} style={fieldStyle} />
+    </div>
+  );
+
+  return (
+    <div onClick={onClose} style={overlay(45)}>
+      <form onClick={e => e.stopPropagation()} onSubmit={submit}
+        style={{ ...sheet, maxWidth: 460, maxHeight: "90dvh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ padding: "16px 18px 14px", borderBottom: `1px solid ${LINE}`, display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+          <div>
+            <h2 style={{ fontSize: 19, fontWeight: 700, margin: 0, letterSpacing: -0.4 }}>{isNew ? "Szybki wpis" : "Edytuj wpis"}</h2>
+            <div style={{ ...caption({ fontSize: 12.5, marginTop: 3 }), ...NUM }}>{dayLabel}</div>
+          </div>
+          <button type="button" onClick={onClose} className="press" aria-label="Zamknij" style={iconBtn}>
+            <Icon d={P_CLOSE} size={15} color={INK_SOFT} stroke={2.2} />
+          </button>
+        </div>
+
+        <div style={{ overflowY: "auto", padding: "16px 18px 20px" }}>
+          <label style={{ ...caption(), display: "block", marginBottom: 6 }}>Nazwa</label>
+          <input value={name} onChange={e => setName(e.target.value)} autoFocus
+            placeholder="np. pizza u Marka" style={{ ...fieldStyle, fontVariantNumeric: "normal" }} />
+
+          <label style={{ ...caption(), display: "block", margin: "14px 0 6px" }}>Kalorie <span style={{ color: MUTED }}>(kcal)</span></label>
+          <input inputMode="decimal" value={kcal} onChange={e => setKcal(e.target.value)} placeholder="—" style={fieldStyle} />
+
+          <button type="button" onClick={() => setMacros(m => !m)} className="press"
+            style={{ display: "flex", alignItems: "center", gap: 6, border: "none", background: "none", cursor: "pointer",
+              color: INK_SOFT, fontSize: 13, fontWeight: 600, padding: "18px 0 8px" }}>
+            <span style={{ display: "flex", transform: macros ? "rotate(90deg)" : "none", transition: "transform .15s ease" }}>
+              <Icon d={P_CHEVRON} size={14} color={INK_SOFT} />
+            </span>
+            Makro (opcjonalnie)
+          </button>
+          {macros && (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {numField("Białko", p, setP)}
+              {numField("Węglow.", c, setC)}
+              {numField("Tłuszcze", f, setF)}
+            </div>
+          )}
+
+          <label style={{ ...caption(), display: "block", margin: "18px 0 8px" }}>Posiłek <span style={{ color: MUTED }}>(opcjonalnie)</span></label>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            <button type="button" onClick={() => setCat("")} className="press" style={pillBtn(!cat)}>Bez przypisania</button>
+            {CATS.map(c2 => (
+              <button key={c2} type="button" onClick={() => setCat(c2 === cat ? "" : c2)} className="press"
+                style={pillBtn(c2 === cat)}>{c2}</button>
+            ))}
+          </div>
+
+          {error && (
+            <div style={{ marginTop: 16, background: RED_SOFT, color: RED_DEEP, borderRadius: R_CTRL,
+              padding: "11px 13px", fontSize: 13, fontWeight: 500, lineHeight: 1.5 }}>{error}</div>
+          )}
+
+          <button type="submit" className="press" style={{ ...primaryBtn, width: "100%", marginTop: 18 }}>
+            {isNew ? "Dodaj" : "Zapisz"}
+          </button>
+
+          {!isNew && (
+            confirmDelete ? (
+              <div style={{ marginTop: 12, display: "flex", gap: 8, alignItems: "center" }}>
+                <span style={{ flex: 1, fontSize: 13, color: INK_SOFT }}>Usunąć ten wpis?</span>
+                <button type="button" onClick={() => setConfirmDelete(false)} className="press" style={pillBtn(false)}>Anuluj</button>
+                <button type="button" onClick={() => onDelete(entry.id)} className="press" style={pillBtn(true, RED)}>Usuń</button>
+              </div>
+            ) : (
+              <button type="button" onClick={() => setConfirmDelete(true)} className="press"
+                style={{ width: "100%", marginTop: 12, border: `1px solid ${LINE}`, background: CARD, color: RED_DEEP,
+                  borderRadius: R_CTRL, padding: "11px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer",
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                <Icon d={P_TRASH} size={15} color={RED_DEEP} /> Usuń wpis
+              </button>
+            )
+          )}
+        </div>
+      </form>
+    </div>
+  );
+}
+
 const pendingKey = userId => `pending-sync-${userId}`;
 
 function readPending(userId) {
@@ -484,21 +623,27 @@ export default function App({ session }) {
   const [shopChecked, setShopChecked] = useState(() => readShopChecked(user.id));
 
   const [eaten, setEaten] = useState({});
+  const [extras, setExtras] = useState({});   // ad-hoc entries per day, see QuickEntryModal
+  const [quick, setQuick] = useState(null);  // the entry being added/edited, or null
+  const [removing, setRemoving] = useState(null); // key of the row currently collapsing
+  const [undo, setUndo] = useState(null);         // what the undo bar would put back
+  const removeTimer = useRef(null);
+  useEffect(() => () => clearTimeout(removeTimer.current), []);
   const [goals, setGoals] = useState(DEFAULT_GOALS);
 
   const alive = useRef(true);
-  const stateRef = useRef({ plan, eaten, goals });
-  useEffect(() => { stateRef.current = { plan, eaten, goals }; });
+  const stateRef = useRef({ plan, eaten, goals, extras });
+  useEffect(() => { stateRef.current = { plan, eaten, goals, extras }; });
 
   // What the server is known to hold, recorded whenever a load succeeds. The sync effects below
   // compare against it so the state change caused by the load itself doesn't count as an edit -
   // without that, every app open pushed all three columns straight back up.
-  const baseline = useRef({ plan, eaten, goals });
+  const baseline = useRef({ plan, eaten, goals, extras });
 
   const loadPlan = useCallback(async () => {
     const { data, error } = await supabase
       .from("plans")
-      .select("plan, eaten, goals")
+      .select("plan, eaten, goals, extras")
       .eq("user_id", user.id)
       .maybeSingle();
     if (!alive.current) return;
@@ -511,11 +656,13 @@ export default function App({ session }) {
       plan: pending.plan ?? (data && data.plan) ?? cur.plan,
       eaten: pending.eaten ?? (data && data.eaten) ?? cur.eaten,
       goals: { ...DEFAULT_GOALS, ...((data && data.goals) || {}), ...(pending.goals || {}) },
+      extras: pending.extras ?? (data && data.extras) ?? cur.extras,
     };
     baseline.current = next;
     setPlan(next.plan);
     setEaten(next.eaten);
     setGoals(next.goals);
+    setExtras(next.extras);
 
     if (error) { console.error(error); setLoadState("error"); return; }
 
@@ -579,19 +726,19 @@ export default function App({ session }) {
   // handled here rather than per component so the recipe preview opened on top of the picker
   // closes first instead of both closing at once.
   useEffect(() => {
-    const isOpen = !!(picker || modal);
+    const isOpen = !!(picker || modal || quick);
     document.body.style.overflow = isOpen ? "hidden" : "";
     if (!isOpen) return () => { document.body.style.overflow = ""; };
     const onKey = e => {
       if (e.key !== "Escape") return;
-      if (modal) setModal(null); else setPicker(null);
+      if (modal) setModal(null); else if (quick) setQuick(null); else setPicker(null);
     };
     window.addEventListener("keydown", onKey);
     return () => {
       document.body.style.overflow = "";
       window.removeEventListener("keydown", onKey);
     };
-  }, [picker, modal]);
+  }, [picker, modal, quick]);
 
   const targetFor = k => goals.days[k] || goals.global;
 
@@ -611,6 +758,8 @@ export default function App({ session }) {
   useEffect(() => { syncCol("plan", plan); }, [plan, loaded, user.id]);
 
   useEffect(() => { syncCol("eaten", eaten); }, [eaten, loaded, user.id]);
+
+  useEffect(() => { syncCol("extras", extras); }, [extras, loaded, user.id]);
 
   const clearEaten = (dateKey, cat) => setEaten(p => {
     if (!p[dateKey] || !p[dateKey][cat]) return p;
@@ -640,6 +789,62 @@ export default function App({ session }) {
     });
   };
 
+  // Removing a meal takes out the day's entry and nothing else: a planned meal keeps its recipe in
+  // RECIPES (a static catalogue we never write to), and the other meals of the day are untouched.
+  // The row collapses first, then the state change lands, so the list animates out.
+  const pendingRemoval = useRef(null);
+
+  const commitRemoval = () => {
+    const p = pendingRemoval.current;
+    if (!p) return;
+    pendingRemoval.current = null;
+    clearTimeout(removeTimer.current);
+    p.commit();
+    setUndo(p.undoState);
+  };
+
+  const removeRow = (key, commit, undoState) => {
+    commitRemoval();                       // a second delete must land the first, not cancel it
+    pendingRemoval.current = { commit, undoState };
+    setRemoving(key);
+    removeTimer.current = setTimeout(() => { setRemoving(null); commitRemoval(); }, 200);
+  };
+
+  const removeMeal = cat => {
+    const id = (plan[selected] || {})[cat];
+    const r = byId[id];
+    const wasEaten = !!(eaten[selected] || {})[cat];
+    const date = selected;
+    removeRow(`meal:${cat}`, () => setMeal(date, cat, null),
+      { message: `Usunięto: ${r ? r.name : cat}`, restore: () => {
+        setPlan(p => ({ ...p, [date]: { ...(p[date] || {}), [cat]: id } }));
+        if (wasEaten) setEaten(p => ({ ...p, [date]: { ...(p[date] || {}), [cat]: true } }));
+      } });
+  };
+
+  const removeQuick = entry => {
+    const date = selected;
+    const index = (extras[date] || []).findIndex(e => e.id === entry.id);
+    removeRow(`quick:${entry.id}`, () => deleteQuick(entry.id),
+      { message: `Usunięto: ${entry.name}`, restore: () => setExtras(p => {
+        const list = [...(p[date] || [])];
+        list.splice(Math.min(index < 0 ? list.length : index, list.length), 0, entry);
+        return { ...p, [date]: list };
+      }) });
+  };
+
+  const saveQuick = item => setExtras(p => {
+    const list = (p[selected] || []).filter(e => e.id !== item.id);
+    return { ...p, [selected]: [...list, item] };
+  });
+
+  const deleteQuick = id => setExtras(p => {
+    const list = (p[selected] || []).filter(e => e.id !== id);
+    const np = { ...p };
+    if (list.length) np[selected] = list; else delete np[selected];
+    return np;
+  });
+
   const fillDay = () => {
     setEaten(p => {
       if (!p[selected]) return p;
@@ -647,7 +852,7 @@ export default function App({ session }) {
       delete np[selected];
       return np;
     });
-    const goal = targetFor(selected);
+    const goal = drawTarget;
     const current = CATS.map(c => (plan[selected] || {})[c]).join(",");
     let pick = null;
     for (let attempt = 0; attempt < 4; attempt++) { // re-draw if we land on the day already shown
@@ -657,11 +862,14 @@ export default function App({ session }) {
     setPlan(p => ({ ...p, [selected]: Object.fromEntries(CATS.map((cat, i) => [cat, pick[i].id])) }));
   };
 
+  // A day's numbers are the planned meals plus anything logged ad-hoc that day.
   const dayTotals = dateKey => {
-    const day = plan[dateKey]; if (!day) return null;
+    const day = plan[dateKey] || {};
     let kcal=0,pr=0,f=0,c=0,n=0;
     CATS.forEach(cat => { const r = byId[day[cat]]; if (r){ kcal+=r.kcal; pr+=r.p; f+=r.f; c+=r.c; n++; } });
-    return n ? { kcal, p: pr, f, c, n } : null;
+    const q = quickTotals(extras[dateKey]);
+    kcal+=q.kcal; pr+=q.p; f+=q.f; c+=q.c; n+=q.n;
+    return n ? { kcal, p: pr, f, c, n, quick: q } : null;
   };
 
   // calendar grid
@@ -729,6 +937,11 @@ export default function App({ session }) {
 
   const sel = plan[selected] || {};
   const totals = dayTotals(selected);
+  // The draw aims at what is left of the goal once ad-hoc entries are accounted for. Four meals
+  // can never total less than MIN_DAY, so a big quick entry can put that target out of reach -
+  // the button says which number it is really aiming at and the hint owns up when it cannot hit it.
+  const quickKcal = quickTotals(extras[selected]).kcal;
+  const drawTarget = targetFor(selected) - quickKcal;
 
   const dateInput = {
     width: "100%", boxSizing: "border-box", padding: "11px 12px", borderRadius: R_CTRL,
@@ -833,6 +1046,8 @@ export default function App({ session }) {
                     const eDay = eaten[selected] || {};
                     let eKcal = 0, eN = 0;
                     CATS.forEach(cat => { const r = byId[sel[cat]]; if (r && eDay[cat]) { eKcal += r.kcal; eN++; } });
+                    // Ad-hoc entries are logged after the fact, so they always count as eaten.
+                    eKcal += totals.quick.kcal; eN += totals.quick.n;
                     return (
                       <div style={{ marginBottom: 20 }}>
                         <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 10 }}>
@@ -864,7 +1079,9 @@ export default function App({ session }) {
                   const r = byId[sel[cat]];
                   const isEaten = !!(eaten[selected] || {})[cat];
                   return (
-                    <div key={cat} style={{ borderTop: i ? `1px solid ${LINE}` : "none", background: isEaten ? GREEN_SOFT : CARD }}>
+                    <SwipeRow key={cat} disabled={!r} collapsing={removing === `meal:${cat}`}
+                      background={isEaten ? GREEN_SOFT : CARD} onDelete={() => removeMeal(cat)}>
+                    <div style={{ borderTop: i ? `1px solid ${LINE}` : "none", background: isEaten ? GREEN_SOFT : CARD }}>
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "10px 12px 0" }}>
                         <span style={{ background: CAT_TINT[cat].bg, color: CAT_TINT[cat].fg, borderRadius: R_PILL, padding: "3px 10px", fontSize: 11.5, fontWeight: 700 }}>{cat}</span>
                         {r && (
@@ -901,17 +1118,71 @@ export default function App({ session }) {
                         )}
                       </button>
                     </div>
+                    </SwipeRow>
                   );
                 })}
               </div>
 
+              {(extras[selected] || []).length > 0 && (
+                <>
+                  <div style={{ ...sectionLabel(), margin: "18px 2px 8px" }}>Dodatkowo</div>
+                  <div style={listBox}>
+                    {(extras[selected] || []).map((e, i) => (
+                      <SwipeRow key={e.id} collapsing={removing === `quick:${e.id}`} onDelete={() => removeQuick(e)}>
+                      <button onClick={() => setQuick(e)} className="press row" style={{
+                        width: "100%", display: "flex", alignItems: "center", gap: 12, textAlign: "left",
+                        border: "none", borderTop: i ? `1px solid ${LINE}` : "none", background: "transparent",
+                        cursor: "pointer", padding: "10px 12px"
+                      }}>
+                        <span style={{ width: 40, height: 40, borderRadius: 10, background: FILL, color: MUTED,
+                          display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                          <Icon d={P_EDIT} size={16} color={MUTED} />
+                        </span>
+                        <span style={{ flex: 1, minWidth: 0 }}>
+                          <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                            <span className="clamp2" style={{ fontSize: 14.5, fontWeight: 600, color: INK, lineHeight: 1.3 }}>{e.name}</span>
+                            <span style={{ background: FILL, color: MUTED, borderRadius: R_PILL, padding: "1px 7px",
+                              fontSize: 10.5, fontWeight: 700, letterSpacing: 0.3, flexShrink: 0 }}>ręczny</span>
+                          </span>
+                          <span className="ellip" style={{ display: "block", fontSize: 12.5, color: MUTED, marginTop: 3, ...NUM }}>
+                            <b style={{ color: INK_SOFT, fontWeight: 600 }}>{e.kcal} kcal</b>
+                            {e.p !== null && e.p !== undefined ? ` · B ${fmtNum(e.p)}` : ""}
+                            {e.f !== null && e.f !== undefined ? ` · T ${fmtNum(e.f)}` : ""}
+                            {e.c !== null && e.c !== undefined ? ` · W ${fmtNum(e.c)}` : ""}
+                            {e.cat ? ` · ${e.cat}` : ""}
+                          </span>
+                        </span>
+                        <Icon d={P_CHEVRON} size={18} color={MUTED} />
+                      </button>
+                      </SwipeRow>
+                    ))}
+                  </div>
+                </>
+              )}
+
+              <button onClick={() => setQuick({})} className="press" style={{
+                marginTop: 12, width: "100%", border: `1px solid ${LINE}`, background: CARD, color: GREEN_DEEP,
+                borderRadius: R_CTRL, padding: "12px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer",
+                display: "flex", alignItems: "center", justifyContent: "center", gap: 8
+              }}>
+                <Icon d={P_PLUS} size={16} color={GREEN_DEEP} stroke={2.2} /> Szybki wpis
+              </button>
+
               <button onClick={fillDay} className="press" style={{
-                marginTop: 18, width: "100%", background: GREEN, color: "#fff", border: "none", borderRadius: R_CTRL,
+                marginTop: 10, width: "100%", background: GREEN, color: "#fff", border: "none", borderRadius: R_CTRL,
                 padding: "14px 18px", fontSize: 15, fontWeight: 600, cursor: "pointer", boxShadow: GREEN_GLOW
-              }}>Wylosuj dzień pod {targetFor(selected)} kcal</button>
+              }}>Wylosuj dzień pod {Math.max(drawTarget, 0)} kcal</button>
               <p style={{ fontSize: 12.5, color: MUTED, margin: "10px 2px 0", lineHeight: 1.55 }}>
                 Losuje 4 posiłki tak, aby suma trafiła w cel (±50 kcal). Kliknij ponownie, jeśli zestaw nie pasuje.
+                {quickKcal > 0 && ` Odliczone ${quickKcal} kcal z szybkich wpisów.`}
               </p>
+              {quickKcal > 0 && drawTarget < MIN_DAY && (
+                <p style={{ fontSize: 12.5, color: AMBER_DEEP, background: AMBER_SOFT, borderRadius: R_CTRL,
+                  padding: "10px 12px", margin: "10px 0 0", lineHeight: 1.55 }}>
+                  Zostało {Math.max(drawTarget, 0)} kcal, a 4 posiłki z bazy to minimum {MIN_DAY} kcal — losowanie
+                  wyjdzie ponad cel. Dobierz posiłki ręcznie albo usuń któryś szybki wpis.
+                </p>
+              )}
             </section>
 
             {/* CALENDAR */}
@@ -946,9 +1217,12 @@ export default function App({ session }) {
                     }}>
                       <span style={{ fontSize: 14, fontWeight: isSel || isToday ? 700 : 500, ...NUM }}>{dt.getDate()}</span>
                       <span style={{ display: "flex", gap: 3, height: 5 }}>
-                        {CATS.map(c => byId[day[c]]
+                        {CATS.map(c => byId[day[c]] || (extras[k] || []).some(e => e.cat === c)
                           ? <span key={c} style={{ width: 5, height: 5, borderRadius: R_PILL, background: isSel ? "rgba(255,255,255,.92)" : CAT_COLORS[c] }} />
                           : null)}
+                        {(extras[k] || []).some(e => !e.cat) && (
+                          <span style={{ width: 5, height: 5, borderRadius: R_PILL, background: isSel ? "rgba(255,255,255,.92)" : MUTED }} />
+                        )}
                       </span>
                       <span style={{ fontSize: 10, fontWeight: 600, height: 13, color: isSel ? "rgba(255,255,255,.9)" : MUTED, ...NUM }}>{t ? t.kcal : ""}</span>
                     </button>
@@ -1036,6 +1310,8 @@ export default function App({ session }) {
             const day = plan[selected] || {};
             let others = 0, filled = 0;
             CATS.forEach(c => { if (c !== picker) { const r = byId[day[c]]; if (r) { others += r.kcal; filled++; } } });
+            const q = quickTotals(extras[selected]);
+            others += q.kcal; filled += q.n;
             const goal = targetFor(selected);
             return { others, filled, goal, remaining: goal - others };
           })()}
@@ -1044,6 +1320,17 @@ export default function App({ session }) {
           onClose={() => setPicker(null)} />
       )}
       {modal && <RecipeModal key={modal.id} recipe={modal} onClose={() => setModal(null)} />}
+      {undo && (
+        <UndoToast message={undo.message}
+          onUndo={() => { undo.restore(); setUndo(null); }}
+          onDismiss={() => setUndo(null)} />
+      )}
+      {quick && (
+        <QuickEntryModal entry={quick} dayLabel={fmtPL(selected)}
+          onSave={item => { saveQuick(item); setQuick(null); }}
+          onDelete={id => { deleteQuick(id); setQuick(null); }}
+          onClose={() => setQuick(null)} />
+      )}
     </div>
   );
 }
