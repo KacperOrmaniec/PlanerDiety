@@ -20,7 +20,7 @@ npm run preview  # serve the dist/ build locally to sanity-check before deployin
 
 There is no lint or test setup in this repo (no ESLint config, no test runner). The closest thing to
 verification is `npm run build` succeeding and manually exercising the app in a browser. The build
-currently emits one ~681 kB JS chunk (~176 kB gzip) and warns about the 500 kB chunk limit — that
+currently emits one ~682 kB JS chunk (~176 kB gzip) and warns about the 500 kB chunk limit — that
 warning is expected, not a regression (see "Known issues").
 
 Requires a `.env.local` (gitignored, see `.env.example`) with `VITE_SUPABASE_URL` and
@@ -59,7 +59,8 @@ Together they are ~340 kB of source that ships eagerly in the main bundle:
 
 - `recipes.js` — exports `RECIPES`, an array of 280 recipe objects, ids 1..280 with no gaps. Shape:
   `{ id, diet, day, cat, name, kcal, p, f, c, port, time, ing: [{ n, d, g }], note, img }`
-  (`diet`/`day` place a recipe within one of 5 named meal plans "Dieta 1"–"Dieta 5"; `cat` is one of
+  (`diet`/`day` place a recipe within one of 5 named meal plans "Dieta 1"–"Dieta 5" — the UI never
+  shows those names, see "Meal plans by calorie level" below; `cat` is one of
   `Śniadanie`/`Obiad`/`Kolacja`/`Przekąska`, 70 recipes each; `port` ∈ {1,2,4,5}; `ing[].g` is grams
   used for shopping-list math; `img` is an optional explicit photo URL — currently no recipe sets it).
 - `categories.js` — exports `ING_CAT`, a map of normalized ingredient name → shopping category
@@ -81,6 +82,29 @@ dot for them (`App.jsx:776` checks `plan[k][cat]` truthiness, not `byId`). Keep 
 regenerations, or plan an explicit migration of the `plans.plan` JSONB.
 
 After regenerating, re-run the photo pipeline (below) so `public/recipes/<id>.jpg` still lines up.
+
+### Meal plans by calorie level
+
+`recipes.js` labels every recipe with a `diet` ("Dieta 1"–"Dieta 5") and a `day`, and each
+`(diet, day)` pair is a designed day of exactly 4 meals — 70 such days in total. Those names mean
+nothing to a user, so `App.jsx` derives `DIET_GROUPS` from the data instead: it averages each diet's
+14 designed-day totals, clusters diets whose averages sit within `GROUP_TOL` (100 kcal) of *each
+other* — compared against the lightest member, so a group never chains across a wider span — and
+labels each cluster with its rounded average. In the current base that yields two groups:
+
+| Group | Diets | Average day |
+|---|---|---|
+| `2400 kcal` | Dieta 1–4 | 2397–2410 kcal |
+| `2700 kcal` | Dieta 5 | 2699 kcal |
+
+`GROUP_OF` maps a recipe's `diet` to its group object (`{ kcal, label, diets }`). The picker's filter
+chips are these groups under a "Plan" caption — the caption matters, because the list below is
+already bucketed by each meal's own kcal (`~700 kcal` headers) and bare "2400 kcal" chips would read
+as a filter on that. A recipe shows `plan 2400` in the compact list row and `plan 2400 kcal, dz. 7`
+in its modal; a recipe with no `diet` falls back to "własny"/"przepis własny".
+
+All of it is derived at module load, so regenerating `recipes.js` with different diets or calorie
+levels re-groups the UI automatically — nothing here hardcodes "Dieta N" or a kcal number.
 
 ### Recipe photos
 
@@ -184,8 +208,8 @@ does not mention Supabase, auth, or the required env vars. Prefer this file.
 
 ## Known issues
 
-Verified against the code. The data-loss group is fixed; the rest is open. Do not
-"rediscover" any of it as new bugs.
+Verified against the code. The data-loss and correctness groups are fixed; performance and the
+minor items are open. Do not "rediscover" any of it as new bugs.
 
 **Data loss — fixed, see "State and persistence"**
 The four ways an edit could be lost (empty-state overwrite after a failed load, `update` silently
@@ -194,21 +218,26 @@ had happened) are addressed by the `loadState` gate, `upsert`, the backoff retry
 chip. Don't reintroduce them: never write a column before a load has succeeded, and never treat a
 resolved write as stored without checking `error`.
 
-**Correctness / UX**
-- `PickerModal` is never keyed or unmounted (`App.jsx:850`), so its `q` search text and `diet` filter
-  persist between openings — searching "kurczak" for Obiad leaves Kolacja filtered by "kurczak".
-- Shopping-list checkboxes (`checked`, `App.jsx:355`) live in component state only: lost on reload,
-  and never reset when the date range changes, so ticks carry over to a different shopping trip.
-- `fillDay` draws from all 280 recipes ignoring `diet`, and the reachable day total is 2256–2787 kcal.
-  At the 2700 target only ~1% of random combos land within ±50 kcal, so "Wylosuj dzień" keeps
-  returning the same handful of high-calorie meals; at 2400 it is ~49%.
-- Orphaned plan entries (a recipe id no longer in `RECIPES`) still render a calendar dot but no meal
-  and no kcal — see the regeneration warning above.
-- Modals close on backdrop click only — no `Escape` handler; picker rows are `role="button"` handling
-  `Enter` but not `Space`.
+**Correctness / UX — fixed**
+Both modals are now rendered conditionally (`{picker && <PickerModal …>}`), so each open remounts
+them and the picker's search box and diet filter start empty. Escape closes the topmost modal —
+handled in `App`'s scroll-lock effect rather than per component, so a recipe preview opened on top of
+the picker closes first instead of both closing at once; picker rows activate on Space as well as
+Enter. Calendar dots go through `byId[...]`, so a plan entry whose recipe id no longer exists no
+longer draws a dot the day panel and totals disagree with. Shopping-list ticks live in
+`localStorage` under `shop-checked-<userId>` together with the date range they belong to, so they
+survive a reload and reset when you plan a different trip (they are deliberately not in Supabase —
+a half-ticked list belongs to the phone in the shop, not to every device).
+
+`drawDay` replaced the old "sample 500 random combos" draw with weighted sampling over a precomputed
+table of how many days reach each kcal total (`SUMS`), which makes a draw uniform over every day
+within tolerance. Verified against an exhaustive count: 11,689,399 fitting days at a 2400 goal,
+268,076 at 2700, and the draw's distribution passes a chi-square goodness-of-fit test at both. The
+tolerance widens from 50 kcal only when nothing fits, so out-of-range goals still return a full day.
+Drawing across all five diets is deliberate — see the comment above `POOLS`.
 
 **Performance**
-- Single ~681 kB bundle: `recipes.js` + `instructions.js` (~330 kB) load eagerly even though `STEPS`
+- Single ~682 kB bundle: `recipes.js` + `instructions.js` (~330 kB) load eagerly even though `STEPS`
   is only needed inside `RecipeModal`.
 - `public/recipes/` is ~23 MB of unresized Pexels JPEGs (largest 942 kB) served into 46–58 px
   thumbnails and a 200 px hero. Combined with the SW's network-first policy, these immutable images

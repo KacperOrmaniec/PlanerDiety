@@ -82,7 +82,112 @@ function RecipeThumb({ r, size }) {
     style={{ width: size, height: size, border: RULE, objectFit: "cover", flexShrink: 0, background: CREAM, display: "block" }} />;
 }
 
-const DIETS = [...new Set(RECIPES.map(r => r.diet).filter(Boolean))].sort((a, b) => a.localeCompare(b, "pl"));
+// "Wylosuj dzień": pick one recipe per category summing to within tolerance of the day's goal.
+// Recipes are drawn across all five diets on purpose - the 70 designed (diet, day) sets only cover
+// a handful of totals (exactly one lands within 50 kcal of 2600), so locking a draw to one diet
+// would leave most targets unreachable.
+const POOLS = CATS.map(cat => RECIPES.filter(r => r.cat === cat));
+const TOLERANCES = [50, 100, 200, 400, Infinity];
+
+// How many kcal totals categories i..end can reach, and in how many ways: SUMS[i].counts[k] is the
+// number of combinations totalling SUMS[i].min + k kcal, with a prefix sum for O(1) window queries.
+// Sampling each category weighted by how many days can still be completed behind it is what makes
+// a draw uniform over every fitting day. Picking blindly (500 random combos, or first-fit
+// backtracking) skews hard once a target nears the top of the reachable 2256-2787 kcal range: the
+// same near-maximum meals keep coming back because few combinations reach that high.
+const SUMS = [{ min: 0, counts: [1] }];
+for (let i = POOLS.length - 1; i >= 0; i--) {
+  const rest = SUMS[0];
+  const kcals = POOLS[i].map(r => r.kcal);
+  const min = rest.min + Math.min(...kcals);
+  const counts = new Float64Array(rest.counts.length + Math.max(...kcals) - Math.min(...kcals));
+  for (const k of kcals)
+    for (let j = 0; j < rest.counts.length; j++) counts[rest.min + j + k - min] += rest.counts[j];
+  SUMS.unshift({ min, counts });
+}
+for (const s of SUMS) {
+  s.pre = new Float64Array(s.counts.length + 1);
+  for (let i = 0; i < s.counts.length; i++) s.pre[i + 1] = s.pre[i] + s.counts[i];
+}
+
+// Number of ways categories i..end land within `tol` of `rem` kcal.
+function waysWithin(i, rem, tol) {
+  const s = SUMS[i];
+  let lo = Math.ceil(rem - tol) - s.min, hi = Math.floor(rem + tol) - s.min;
+  lo = Number.isFinite(lo) ? Math.max(0, lo) : 0;
+  hi = Number.isFinite(hi) ? Math.min(s.counts.length - 1, hi) : s.counts.length - 1;
+  return hi < lo ? 0 : s.pre[hi + 1] - s.pre[lo];
+}
+
+function drawDay(goal) {
+  const tol = TOLERANCES.find(t => waysWithin(0, goal, t) > 0); // widened only if nothing fits
+  const out = [];
+  let rem = goal;
+  for (let i = 0; i < POOLS.length; i++) {
+    const weights = POOLS[i].map(r => waysWithin(i + 1, rem - r.kcal, tol));
+    let x = Math.random() * weights.reduce((a, b) => a + b, 0), k = 0;
+    while (k < weights.length - 1 && x >= weights[k]) { x -= weights[k]; k++; }
+    out.push(POOLS[i][k]);
+    rem -= POOLS[i][k].kcal;
+  }
+  return out;
+}
+
+// Shopping-list ticks: kept per date range so they reset when you plan a different trip, and
+// in localStorage (not Supabase) because a half-ticked list belongs to the phone in the shop.
+const shopKey = userId => `shop-checked-${userId}`;
+const rangeOf = (a, b) => (a <= b ? `${a}..${b}` : `${b}..${a}`);
+const NO_TICKS = {};
+
+function readShopChecked(userId) {
+  try {
+    const v = JSON.parse(localStorage.getItem(shopKey(userId)));
+    return v && v.items ? v : { range: "", items: NO_TICKS };
+  } catch { return { range: "", items: NO_TICKS }; }
+}
+
+// Diets are grouped by the calorie level they actually plan for, not by their spreadsheet name:
+// each "Dieta N" is 14 designed days, and diets whose average day lands within GROUP_TOL of each
+// other (all of them, not just pairwise neighbours) are one and the same plan as far as anyone
+// choosing a meal is concerned. In the current
+// base that joins Dieta 1-4 (2397-2410 kcal/day) into "2400 kcal" and leaves Dieta 5 (2699) as
+// "2700 kcal". Derived from RECIPES so it stays right when the base is regenerated from Excel.
+const GROUP_TOL = 100;
+
+const DIET_GROUPS = (() => {
+  const dayKcal = {};                                  // `${diet}|${day}` -> kcal of that designed day
+  for (const r of RECIPES) {
+    if (!r.diet) continue;
+    const k = `${r.diet}|${r.day}`;
+    dayKcal[k] = (dayKcal[k] || 0) + r.kcal;
+  }
+  const perDiet = {};
+  for (const [k, kcal] of Object.entries(dayKcal)) {
+    const diet = k.slice(0, k.lastIndexOf("|"));
+    (perDiet[diet] = perDiet[diet] || []).push(kcal);
+  }
+  const means = Object.entries(perDiet)
+    .map(([diet, days]) => ({ diet, mean: days.reduce((a, b) => a + b, 0) / days.length }))
+    .sort((a, b) => a.mean - b.mean);
+
+  // Compared against the lightest diet already in the cluster (the list is sorted), so a group
+  // never chains: every diet in one is within GROUP_TOL of every other, not just of its neighbour.
+  const clusters = [];
+  for (const d of means) {
+    const last = clusters[clusters.length - 1];
+    if (last && d.mean - last.means[0] <= GROUP_TOL) { last.diets.push(d.diet); last.means.push(d.mean); }
+    else clusters.push({ diets: [d.diet], means: [d.mean] });
+  }
+  return clusters.map(c => {
+    const mean = c.means.reduce((a, b) => a + b, 0) / c.means.length;
+    const kcal = Math.round(mean / 100) * 100;
+    return { kcal, label: `${kcal} kcal`, diets: c.diets };
+  });
+})();
+
+// recipe's diet -> the group it belongs to, for filtering and for the "plan" line on a recipe
+const GROUP_OF = {};
+DIET_GROUPS.forEach(g => g.diets.forEach(d => { GROUP_OF[d] = g; }));
 const TARGETS = [2400, 2500, 2600, 2700];
 const DEFAULT_GOALS = { global: 2400, days: {} };
 
@@ -91,12 +196,13 @@ const closeBtn = {
   fontSize: 17, fontWeight: 700, cursor: "pointer", flexShrink: 0, lineHeight: 1, fontFamily: SANS
 };
 
+// Rendered only while open (and therefore remounted on every open), so the search box and diet
+// filter always start empty instead of carrying over from the last category that was picked.
 function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
   const [q, setQ] = useState("");
-  const [diet, setDiet] = useState("");
-  if (!cat) return null;
+  const [group, setGroup] = useState(null);
   const query = q.trim().toLowerCase();
-  const match = r => r.cat === cat && (!diet || r.diet === diet) && (!query || r.name.toLowerCase().includes(query));
+  const match = r => r.cat === cat && (!group || GROUP_OF[r.diet] === group) && (!query || r.name.toLowerCase().includes(query));
   const buckets = {};
   RECIPES.filter(match).forEach(r => {
     const b = Math.round(r.kcal / 100) * 100;
@@ -127,9 +233,12 @@ function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
           )}
           <input value={q} onChange={e => setQ(e.target.value)} placeholder="Szukaj po nazwie…" autoFocus
             style={{ width: "100%", boxSizing: "border-box", marginTop: 10, padding: "9px 11px", border: RULE, background: PAPER, fontSize: 14, fontFamily: SANS, fontWeight: 500, color: INK }} />
-          <div style={{ display: "flex", gap: 5, marginTop: 9, flexWrap: "wrap" }}>
-            <button onClick={() => setDiet("")} style={chipStyle(!diet)}>Wszystkie</button>
-            {DIETS.map(d => <button key={d} onClick={() => setDiet(d === diet ? "" : d)} style={chipStyle(d === diet)}>{d}</button>)}
+          <div style={{ display: "flex", gap: 5, marginTop: 9, flexWrap: "wrap", alignItems: "center" }}>
+            <span style={{ ...label(), color: MUTED, marginRight: 3 }}>Plan</span>
+            <button onClick={() => setGroup(null)} style={chipStyle(!group)}>Wszystkie</button>
+            {DIET_GROUPS.map(g => (
+              <button key={g.label} onClick={() => setGroup(g === group ? null : g)} style={chipStyle(g === group)}>{g.label}</button>
+            ))}
           </div>
         </div>
         <div style={{ overflowY: "auto", padding: "0 14px 16px" }}>
@@ -146,7 +255,7 @@ function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
                 const fits = ctx && ctx.filled === CATS.length - 1 && Math.abs(r.kcal - ctx.remaining) <= 60;
                 return (
                   <div key={r.id} onClick={() => onPick(r.id)} role="button" tabIndex={0}
-                    onKeyDown={e => { if (e.key === "Enter") onPick(r.id); }}
+                    onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPick(r.id); } }}
                     style={{ display: "flex", gap: 11, alignItems: "center", padding: "9px 8px", cursor: "pointer",
                       background: isSel ? CAT_COLORS[cat] + "22" : "transparent",
                       border: isSel ? RULE : "2px solid transparent", marginTop: 6 }}>
@@ -154,7 +263,7 @@ function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 14, fontWeight: 700, color: INK, lineHeight: 1.25, fontFamily: SANS }}>{r.name}</div>
                       <div style={{ fontSize: 11, color: MUTED, marginTop: 4, fontFamily: MONO, lineHeight: 1.5 }}>
-                        <b style={{ color: INK }}>{r.kcal} kcal</b> · B {r.p} · T {r.f} · W {r.c}{r.time ? ` · ${r.time} min` : ""}{r.diet ? ` · ${r.diet}${r.day ? `/${r.day}` : ""}` : " · własny"}
+                        <b style={{ color: INK }}>{r.kcal} kcal</b> · B {r.p} · T {r.f} · W {r.c}{r.time ? ` · ${r.time} min` : ""}{GROUP_OF[r.diet] ? ` · plan ${GROUP_OF[r.diet].kcal}` : " · własny"}
                       </div>
                     </div>
                     {fits && <span style={{ background: RED, color: "#fff", border: RULE_THIN, padding: "2px 7px", fontSize: 10, fontWeight: 700, flexShrink: 0, textTransform: "uppercase", letterSpacing: 0.5, fontFamily: SANS }}>Pasuje</span>}
@@ -175,7 +284,6 @@ function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
 }
 
 function RecipeModal({ recipe, onClose }) {
-  if (!recipe) return null;
   const steps = (STEPS[recipe.id] || "")
     .split("\n")
     .map(l => l.replace(/^\s*\d+[.)]\s*/, "").trim())
@@ -190,7 +298,7 @@ function RecipeModal({ recipe, onClose }) {
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
               <span style={{ background: CAT_COLORS[recipe.cat], border: RULE_THIN, padding: "2px 8px", ...label({ color: "#fff", fontSize: 10 }) }}>{recipe.cat}</span>
-              <span style={{ fontSize: 10.5, color: MUTED, fontFamily: MONO }}>{recipe.diet}, dz. {recipe.day}{recipe.time ? ` · ok. ${recipe.time} min` : ""}</span>
+              <span style={{ fontSize: 10.5, color: MUTED, fontFamily: MONO }}>{GROUP_OF[recipe.diet] ? `plan ${GROUP_OF[recipe.diet].label}, dz. ${recipe.day}` : "przepis własny"}{recipe.time ? ` · ok. ${recipe.time} min` : ""}</span>
             </div>
             <h2 style={{ fontFamily: SANS, fontSize: 25, fontWeight: 800, margin: "8px 0 12px", color: INK, lineHeight: 1.1, letterSpacing: -0.6 }}>{recipe.name}</h2>
           </div>
@@ -352,7 +460,7 @@ export default function App({ session }) {
   const [picker, setPicker] = useState(null);
   const [from, setFrom] = useState(keyOf(today));
   const [to, setTo] = useState(keyOf(new Date(today.getTime() + 2*86400000)));
-  const [checked, setChecked] = useState({});
+  const [shopChecked, setShopChecked] = useState(() => readShopChecked(user.id));
 
   const [eaten, setEaten] = useState({});
   const [goals, setGoals] = useState(DEFAULT_GOALS);
@@ -446,11 +554,22 @@ export default function App({ session }) {
 
   // Locks background scroll while a modal is open. Without this, focusing the search
   // input on iOS scrolls the underlying page along with the "fixed" overlay (a WebKit
-  // quirk), which reveals the app header above the modal.
+  // quirk), which reveals the app header above the modal. Escape closes the topmost one -
+  // handled here rather than per component so the recipe preview opened on top of the picker
+  // closes first instead of both closing at once.
   useEffect(() => {
     const isOpen = !!(picker || modal);
     document.body.style.overflow = isOpen ? "hidden" : "";
-    return () => { document.body.style.overflow = ""; };
+    if (!isOpen) return () => { document.body.style.overflow = ""; };
+    const onKey = e => {
+      if (e.key !== "Escape") return;
+      if (modal) setModal(null); else setPicker(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.body.style.overflow = "";
+      window.removeEventListener("keydown", onKey);
+    };
   }, [picker, modal]);
 
   const targetFor = k => goals.days[k] || goals.global;
@@ -508,16 +627,12 @@ export default function App({ session }) {
       return np;
     });
     const goal = targetFor(selected);
-    const pools = CATS.map(cat => RECIPES.filter(r => r.cat === cat));
-    const hits = [];
-    let best = null, bestDiff = Infinity;
-    for (let i = 0; i < 500; i++) {
-      const combo = pools.map(pool => pool[Math.floor(Math.random() * pool.length)]);
-      const diff = Math.abs(combo.reduce((s, r) => s + r.kcal, 0) - goal);
-      if (diff <= 50) hits.push(combo);
-      if (diff < bestDiff) { bestDiff = diff; best = combo; }
+    const current = CATS.map(c => (plan[selected] || {})[c]).join(",");
+    let pick = null;
+    for (let attempt = 0; attempt < 4; attempt++) { // re-draw if we land on the day already shown
+      pick = drawDay(goal);
+      if (pick.map(r => r.id).join(",") !== current) break;
     }
-    const pick = hits.length ? hits[Math.floor(Math.random() * hits.length)] : best;
     setPlan(p => ({ ...p, [selected]: Object.fromEntries(CATS.map((cat, i) => [cat, pick[i].id])) }));
   };
 
@@ -575,6 +690,21 @@ export default function App({ session }) {
     const total = groups.reduce((s, g) => s + g.items.length, 0);
     return { groups, total, meals, kcal, days: days.size };
   }, [tab, from, to, plan]);
+
+  // Ticks belong to one date range: change the range and the list starts unticked again.
+  const shopRange = rangeOf(from, to);
+  const checked = shopChecked.range === shopRange ? shopChecked.items : NO_TICKS;
+  const toggleChecked = key => setShopChecked(s => {
+    const items = { ...(s.range === shopRange ? s.items : NO_TICKS) };
+    if (items[key]) delete items[key]; else items[key] = true;
+    return { range: shopRange, items };
+  });
+  useEffect(() => {
+    try {
+      if (Object.keys(shopChecked.items).length) localStorage.setItem(shopKey(user.id), JSON.stringify(shopChecked));
+      else localStorage.removeItem(shopKey(user.id));
+    } catch (e) { console.error(e); }
+  }, [shopChecked, user.id]);
 
   const sel = plan[selected] || {};
   const totals = dayTotals(selected);
@@ -773,7 +903,7 @@ export default function App({ session }) {
                     }}>
                       <span style={{ fontSize: 12.5, fontWeight: isToday || isSel ? 700 : 500, fontFamily: MONO }}>{dt.getDate()}</span>
                       <span style={{ display: "flex", gap: 2 }}>
-                        {CATS.map(c => day[c] ? <span key={c} style={{ width: 5, height: 5, background: CAT_COLORS[c] }} /> : null)}
+                        {CATS.map(c => byId[day[c]] ? <span key={c} style={{ width: 5, height: 5, background: CAT_COLORS[c] }} /> : null)}
                       </span>
                       {t && <span style={{ fontSize: 9, color: isSel ? CREAM : MUTED, fontWeight: 700, fontFamily: MONO }}>{t.kcal}</span>}
                     </button>
@@ -825,7 +955,7 @@ export default function App({ session }) {
                           return (
                             <li key={item.key}>
                               <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 8px", borderBottom: `1px solid ${INK}22`, cursor: "pointer", opacity: done ? 0.4 : 1 }}>
-                                <input type="checkbox" checked={!!done} onChange={() => setChecked(c => ({ ...c, [item.key]: !c[item.key] }))} style={{ width: 17, height: 17, accentColor: RED, flexShrink: 0 }} />
+                                <input type="checkbox" checked={!!done} onChange={() => toggleChecked(item.key)} style={{ width: 17, height: 17, accentColor: RED, flexShrink: 0 }} />
                                 <span style={{ flex: 1, fontSize: 13.5, fontWeight: 500, textDecoration: done ? "line-through" : "none" }}>{item.name}</span>
                                 <span style={{ fontWeight: 700, fontSize: 12, color: INK, fontFamily: MONO }}>{fmtG(item.g)}</span>
                               </label>
@@ -847,18 +977,20 @@ export default function App({ session }) {
         )}
       </main>
 
-      <PickerModal cat={picker} currentId={picker ? (plan[selected] || {})[picker] : null}
-        ctx={picker ? (() => {
-          const day = plan[selected] || {};
-          let others = 0, filled = 0;
-          CATS.forEach(c => { if (c !== picker) { const r = byId[day[c]]; if (r) { others += r.kcal; filled++; } } });
-          const goal = targetFor(selected);
-          return { others, filled, goal, remaining: goal - others };
-        })() : null}
-        onPick={id => { setMeal(selected, picker, id); setPicker(null); }}
-        onPreview={r => setModal(r)}
-        onClose={() => setPicker(null)} />
-      <RecipeModal recipe={modal} onClose={() => setModal(null)} />
+      {picker && (
+        <PickerModal cat={picker} currentId={(plan[selected] || {})[picker]}
+          ctx={(() => {
+            const day = plan[selected] || {};
+            let others = 0, filled = 0;
+            CATS.forEach(c => { if (c !== picker) { const r = byId[day[c]]; if (r) { others += r.kcal; filled++; } } });
+            const goal = targetFor(selected);
+            return { others, filled, goal, remaining: goal - others };
+          })()}
+          onPick={id => { setMeal(selected, picker, id); setPicker(null); }}
+          onPreview={r => setModal(r)}
+          onClose={() => setPicker(null)} />
+      )}
+      {modal && <RecipeModal recipe={modal} onClose={() => setModal(null)} />}
     </div>
   );
 }
