@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { RECIPES } from "./data/recipes.js";
 import { STEPS } from "./data/instructions.js";
 import { ING_CAT } from "./data/categories.js";
@@ -84,6 +84,7 @@ function RecipeThumb({ r, size }) {
 
 const DIETS = [...new Set(RECIPES.map(r => r.diet).filter(Boolean))].sort((a, b) => a.localeCompare(b, "pl"));
 const TARGETS = [2400, 2500, 2600, 2700];
+const DEFAULT_GOALS = { global: 2400, days: {} };
 
 const closeBtn = {
   border: RULE, background: PAPER, color: INK, width: 34, height: 34,
@@ -238,45 +239,101 @@ function readPending(userId) {
   catch { return {}; }
 }
 
+// Anything that changes the unsaved-work set notifies the header indicator.
+const syncListeners = new Set();
+function subscribeSync(fn) { syncListeners.add(fn); return () => syncListeners.delete(fn); }
+
+function writePending(userId, next) {
+  try {
+    if (Object.keys(next).length) localStorage.setItem(pendingKey(userId), JSON.stringify(next));
+    else localStorage.removeItem(pendingKey(userId));
+  } catch (e) {
+    console.error(e); // private mode / quota - the in-memory queue still retries
+  }
+  syncListeners.forEach(fn => fn());
+}
+
+function stashPending(userId, column, value) {
+  writePending(userId, { ...readPending(userId), [column]: value });
+}
+
 function clearPendingColumn(userId, column) {
   const rest = readPending(userId);
   delete rest[column];
-  if (Object.keys(rest).length) localStorage.setItem(pendingKey(userId), JSON.stringify(rest));
-  else localStorage.removeItem(pendingKey(userId));
+  writePending(userId, rest);
 }
 
-// Column writes are whole-value overwrites (not diffs). Requests for the same user+column
-// are sent one at a time, never concurrently: if a write comes in while one is already in
-// flight, its value just replaces whatever was queued and gets sent the moment the in-flight
-// request resolves. This keeps responses in send order, so a slow request can't finish after
-// a newer one and clobber fresher data, and it coalesces bursts of rapid changes (e.g. "Wylosuj
-// dzień") into one trailing request instead of firing one per change.
-const inFlight = new Map(); // `${userId}:${column}` -> { queued: value | undefined }
+function hasPending(userId) { return Object.keys(readPending(userId)).length > 0; }
+
+function flushPending(userId) {
+  const pending = readPending(userId);
+  for (const column of Object.keys(pending)) syncColumn(userId, column, pending[column]);
+}
+
+// Column writes are whole-value overwrites (not diffs), so every request has to carry exactly
+// the value the server should end up with:
+//   * The value is stashed in localStorage first and only cleared once the server confirms it,
+//     so a failed request, a crash or a closed tab never drops an edit.
+//   * Requests for the same user+column are sent one at a time, never concurrently: a write
+//     arriving mid-flight replaces whatever is queued and goes out when the in-flight request
+//     resolves. Responses therefore stay in send order (a slow request can't land after a newer
+//     one and clobber fresher data) and bursts of changes (e.g. "Wylosuj dzień") coalesce into
+//     one trailing request instead of one request per change.
+//   * A failed request is retried with exponential backoff (capped at RETRY_MAX) while holding
+//     its queue slot, so later edits fold into the retry instead of racing it. A fresh edit or
+//     an "online" event cancels the backoff and retries immediately.
+// Writes use upsert, not update: `update ... .eq("user_id", ...)` that matches no row resolves
+// with error === null, so a missing plans row (first-login insert failed, row deleted) used to
+// look like a successful save while nothing was stored.
+const RETRY_MAX = 30000;
+const inFlight = new Map(); // `${userId}:${column}` -> { queued, retry, attempt }
 
 function syncColumn(userId, column, value) {
-  const pending = readPending(userId);
-  localStorage.setItem(pendingKey(userId), JSON.stringify({ ...pending, [column]: value }));
+  stashPending(userId, column, value);
 
   const key = `${userId}:${column}`;
   const state = inFlight.get(key);
-  if (state) { state.queued = value; return; }
+  if (state) {
+    state.queued = value;
+    if (state.retry) { // a new edit is a good moment to retry a failed write
+      clearTimeout(state.retry);
+      state.retry = null;
+      state.attempt = 0;
+      sendQueued(userId, column);
+    }
+    return;
+  }
 
-  inFlight.set(key, { queued: undefined });
+  inFlight.set(key, { queued: undefined, retry: null, attempt: 0 });
+  sendColumn(userId, column, value);
+}
+
+function sendQueued(userId, column) {
+  const state = inFlight.get(`${userId}:${column}`);
+  if (!state || state.queued === undefined) return;
+  const value = state.queued;
+  state.queued = undefined;
   sendColumn(userId, column, value);
 }
 
 function sendColumn(userId, column, value) {
   const key = `${userId}:${column}`;
-  supabase.from("plans").update({ [column]: value, updated_at: new Date().toISOString() }).eq("user_id", userId)
+  supabase.from("plans")
+    .upsert({ user_id: userId, [column]: value, updated_at: new Date().toISOString() }, { onConflict: "user_id" })
     .then(({ error }) => {
       const state = inFlight.get(key);
-      if (error) { console.error(error); inFlight.delete(key); return; }
-      if (state && state.queued !== undefined) {
-        const next = state.queued;
-        state.queued = undefined;
-        sendColumn(userId, column, next);
+      if (!state) return;
+      if (error) {
+        console.error(error);
+        if (state.queued === undefined) state.queued = value; // keep it queued, never drop it
+        state.retry = setTimeout(() => { state.retry = null; sendQueued(userId, column); },
+          Math.min(RETRY_MAX, 1000 * 2 ** state.attempt));
+        state.attempt += 1;
+        syncListeners.forEach(fn => fn());
         return;
       }
+      state.attempt = 0;
+      if (state.queued !== undefined) { sendQueued(userId, column); return; }
       inFlight.delete(key);
       clearPendingColumn(userId, column);
     });
@@ -289,7 +346,8 @@ export default function App({ session }) {
   const [view, setView] = useState({ y: today.getFullYear(), m: today.getMonth() });
   const [selected, setSelected] = useState(keyOf(today));
   const [plan, setPlan] = useState({});
-  const [loaded, setLoaded] = useState(false);
+  const [loadState, setLoadState] = useState("loading"); // "loading" | "ready" | "error"
+  const loaded = loadState === "ready";
   const [modal, setModal] = useState(null);
   const [picker, setPicker] = useState(null);
   const [from, setFrom] = useState(keyOf(today));
@@ -297,54 +355,94 @@ export default function App({ session }) {
   const [checked, setChecked] = useState({});
 
   const [eaten, setEaten] = useState({});
-  const [goals, setGoals] = useState({ global: 2400, days: {} });
+  const [goals, setGoals] = useState(DEFAULT_GOALS);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const { data, error } = await supabase
-        .from("plans")
-        .select("plan, eaten, goals")
-        .eq("user_id", user.id)
-        .maybeSingle();
-      if (cancelled) return;
-      const pending = readPending(user.id);
-      const restorePending = () => {
-        if (pending.plan) setPlan(pending.plan);
-        if (pending.eaten) setEaten(pending.eaten);
-        if (pending.goals) setGoals(g => ({ ...g, ...pending.goals }));
-      };
-      if (data) {
-        setPlan(pending.plan ?? data.plan ?? {});
-        setEaten(pending.eaten ?? data.eaten ?? {});
-        setGoals(g => ({ ...g, ...(data.goals || {}), ...(pending.goals || {}) }));
-      } else if (!error) {
-        const { error: insertError } = await supabase.from("plans").insert({ user_id: user.id });
-        if (insertError) console.error(insertError);
-        restorePending();
-      } else {
-        console.error(error);
-        restorePending();
-      }
-      if (!cancelled) setLoaded(true);
-    })();
-    return () => { cancelled = true; };
+  const alive = useRef(true);
+  const stateRef = useRef({ plan, eaten, goals });
+  useEffect(() => { stateRef.current = { plan, eaten, goals }; });
+
+  // What the server is known to hold, recorded whenever a load succeeds. The sync effects below
+  // compare against it so the state change caused by the load itself doesn't count as an edit -
+  // without that, every app open pushed all three columns straight back up.
+  const baseline = useRef({ plan, eaten, goals });
+
+  const loadPlan = useCallback(async () => {
+    const { data, error } = await supabase
+      .from("plans")
+      .select("plan, eaten, goals")
+      .eq("user_id", user.id)
+      .maybeSingle();
+    if (!alive.current) return;
+
+    // Anything left unsent from an earlier session wins over the server copy: it was made on top
+    // of a fully loaded plan and hasn't been stored yet.
+    const pending = readPending(user.id);
+    const cur = stateRef.current;
+    const next = {
+      plan: pending.plan ?? (data && data.plan) ?? cur.plan,
+      eaten: pending.eaten ?? (data && data.eaten) ?? cur.eaten,
+      goals: { ...DEFAULT_GOALS, ...((data && data.goals) || {}), ...(pending.goals || {}) },
+    };
+    baseline.current = next;
+    setPlan(next.plan);
+    setEaten(next.eaten);
+    setGoals(next.goals);
+
+    if (error) { console.error(error); setLoadState("error"); return; }
+
+    if (!data) { // first login: create the row (ignoreDuplicates keeps StrictMode's double run quiet)
+      const { error: insertError } = await supabase.from("plans")
+        .upsert({ user_id: user.id }, { onConflict: "user_id", ignoreDuplicates: true });
+      if (!alive.current) return;
+      if (insertError) { console.error(insertError); setLoadState("error"); return; }
+    }
+
+    setLoadState("ready");
+    flushPending(user.id);
   }, [user.id]);
 
   useEffect(() => {
-    if (!loaded) return;
-    const flush = () => {
-      const pending = readPending(user.id);
-      for (const column of Object.keys(pending)) syncColumn(user.id, column, pending[column]);
-    };
-    window.addEventListener("online", flush);
-    return () => window.removeEventListener("online", flush);
-  }, [loaded, user.id]);
+    alive.current = true;
+    loadPlan();
+    return () => { alive.current = false; };
+  }, [loadPlan]);
+
+  // A failed load leaves us not knowing what the server holds, so the app refuses to render the
+  // planner (see the error card below) rather than let edits pile up on top of this session's
+  // empty defaults and overwrite the stored plan. Keep retrying until one succeeds.
+  useEffect(() => {
+    if (loadState !== "error") return;
+    const id = setInterval(loadPlan, 15000);
+    return () => clearInterval(id);
+  }, [loadState, loadPlan]);
 
   useEffect(() => {
-    if (!loaded) return;
-    syncColumn(user.id, "goals", goals);
-  }, [goals, loaded, user.id]);
+    const onOnline = () => { if (loadState === "error") loadPlan(); else if (loaded) flushPending(user.id); };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  }, [loadState, loaded, loadPlan, user.id]);
+
+  const [unsaved, setUnsaved] = useState(false);
+  const [online, setOnline] = useState(() => navigator.onLine);
+  useEffect(() => {
+    const update = () => { setUnsaved(hasPending(user.id)); setOnline(navigator.onLine); };
+    update();
+    window.addEventListener("online", update);
+    window.addEventListener("offline", update);
+    const unsubscribe = subscribeSync(update);
+    return () => {
+      window.removeEventListener("online", update);
+      window.removeEventListener("offline", update);
+      unsubscribe();
+    };
+  }, [user.id]);
+
+  const syncCol = (column, value) => {
+    if (!loaded || value === baseline.current[column]) return;
+    syncColumn(user.id, column, value);
+  };
+
+  useEffect(() => { syncCol("goals", goals); }, [goals, loaded, user.id]);
 
   // Locks background scroll while a modal is open. Without this, focusing the search
   // input on iOS scrolls the underlying page along with the "fixed" overlay (a WebKit
@@ -370,15 +468,9 @@ export default function App({ session }) {
     return { global: t, days };
   });
 
-  useEffect(() => {
-    if (!loaded) return;
-    syncColumn(user.id, "plan", plan);
-  }, [plan, loaded, user.id]);
+  useEffect(() => { syncCol("plan", plan); }, [plan, loaded, user.id]);
 
-  useEffect(() => {
-    if (!loaded) return;
-    syncColumn(user.id, "eaten", eaten);
-  }, [eaten, loaded, user.id]);
+  useEffect(() => { syncCol("eaten", eaten); }, [eaten, loaded, user.id]);
 
   const clearEaten = (dateKey, cat) => setEaten(p => {
     if (!p[dateKey] || !p[dateKey][cat]) return p;
@@ -509,6 +601,12 @@ export default function App({ session }) {
             <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap" }}>
               <h1 style={{ fontFamily: SANS, fontSize: 27, fontWeight: 800, margin: 0, letterSpacing: -0.8, textTransform: "uppercase" }}>Planer diety</h1>
               <span style={{ fontSize: 11, color: "#A8A092", fontFamily: MONO }}>{RECIPES.length} przepisów · cel {goals.global} kcal</span>
+              {unsaved && (
+                <span title="Zmiany są zapisane w tej przeglądarce i zostaną wysłane na serwer, gdy tylko się uda."
+                  style={{ background: "#F0A202", color: INK, border: `2px solid ${CREAM}`, padding: "2px 8px", fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.6, fontFamily: SANS }}>
+                  {online ? "Zapisywanie…" : "Offline — zapiszę później"}
+                </span>
+              )}
             </div>
             <button onClick={() => supabase.auth.signOut()} title={user.email} style={{
               border: `2px solid ${CREAM}`, background: "none", color: CREAM,
@@ -531,7 +629,22 @@ export default function App({ session }) {
       </header>
 
       <main style={{ maxWidth: 1060, margin: "0 auto", padding: "22px 16px calc(60px + env(safe-area-inset-bottom))" }}>
-        {!loaded && <div style={{ color: MUTED, fontSize: 13, fontFamily: MONO }}>Wczytywanie planu…</div>}
+        {loadState === "loading" && <div style={{ color: MUTED, fontSize: 13, fontFamily: MONO }}>Wczytywanie planu…</div>}
+
+        {loadState === "error" && (
+          <section style={{ ...card, maxWidth: 560, margin: "0 auto" }}>
+            <h2 style={{ fontFamily: SANS, fontSize: 21, fontWeight: 800, margin: "0 0 10px", textTransform: "uppercase", letterSpacing: -0.5 }}>Nie udało się wczytać planu</h2>
+            <p style={{ fontSize: 13, color: MUTED, lineHeight: 1.6, margin: "0 0 16px", fontFamily: SANS }}>
+              Twój plan jest bezpieczny — po prostu nie mamy do niego teraz dostępu. Edycja jest wyłączona,
+              żeby przypadkiem nie nadpisać go pustym planem. {unsaved && "Niewysłane zmiany czekają w tej przeglądarce. "}
+              Próbujemy ponownie automatycznie co 15 sekund.
+            </p>
+            <button onClick={() => { setLoadState("loading"); loadPlan(); }} className="b" style={{
+              background: RED, color: "#fff", border: RULE, boxShadow: HARD_SM, padding: "11px 18px",
+              fontWeight: 700, fontSize: 12.5, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.8
+            }}>Spróbuj ponownie</button>
+          </section>
+        )}
 
         {tab === "cal" && loaded && (
           <div style={{ display: "grid", gridTemplateColumns: "minmax(300px, 1.15fr) minmax(300px, 1fr)", gap: 20, alignItems: "start" }}>
