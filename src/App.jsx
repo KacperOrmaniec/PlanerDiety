@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { RECIPES } from "./data/recipes.js";
 import { STEPS } from "./data/instructions.js";
 import { ING_CAT } from "./data/categories.js";
+import { CATS, SLOT_POOLS, slotsOfId, allowedIn, primarySlot } from "./slots.js";
 import { supabase } from "./lib/supabaseClient.js";
 
 import {
@@ -15,7 +16,7 @@ import {
 } from "./ui.jsx";
 import Progress from "./Progress.jsx";
 
-const CATS = ["Śniadanie", "Obiad", "Kolacja", "Przekąska"];
+// CATS (the four meal slots) lives in slots.js, next to the rules saying which recipe may go where.
 // Category colours deliberately avoid green, so a coloured dot never reads as "on target".
 const CAT_COLORS = { "Śniadanie": "#FF9F0A", "Obiad": "#30B0C7", "Kolacja": "#5E5CE6", "Przekąska": "#FF375F" };
 const CAT_TINT = {
@@ -67,10 +68,11 @@ function MacroChips({ r, size }) {
 function RecipeThumb({ r, size, radius = 12 }) {
   const [err, setErr] = useState(false);
   const box = { width: size, height: size, borderRadius: radius, flexShrink: 0, display: "block" };
+  const slot = primarySlot(r);
   if (err) return (
-    <div style={{ ...box, background: CAT_TINT[r.cat].bg, color: CAT_TINT[r.cat].fg,
+    <div style={{ ...box, background: CAT_TINT[slot].bg, color: CAT_TINT[slot].fg,
       display: "flex", alignItems: "center", justifyContent: "center",
-      fontSize: Math.round(size * 0.4), fontWeight: 700 }}>{CAT_MARK[r.cat]}</div>
+      fontSize: Math.round(size * 0.4), fontWeight: 700 }}>{CAT_MARK[slot]}</div>
   );
   return <img src={r.img || `recipes/${r.id}.jpg`} alt="" loading="lazy" onError={() => setErr(true)}
     style={{ ...box, objectFit: "cover", background: FILL, boxShadow: `inset 0 0 0 1px ${LINE}` }} />;
@@ -80,7 +82,9 @@ function RecipeThumb({ r, size, radius = 12 }) {
 // Recipes are drawn across all five diets on purpose - the 70 designed (diet, day) sets only cover
 // a handful of totals (exactly one lands within 50 kcal of 2600), so locking a draw to one diet
 // would leave most targets unreachable.
-const POOLS = CATS.map(cat => RECIPES.filter(r => r.cat === cat));
+// Drawn from what each slot actually allows (see slots.js), so a draw never puts an owsianka
+// on the dinner slot just because the spreadsheet filed it there.
+const POOLS = CATS.map(cat => SLOT_POOLS[cat]);
 const TOLERANCES = [50, 100, 200, 400, Infinity];
 
 // How many kcal totals categories i..end can reach, and in how many ways: SUMS[i].counts[k] is the
@@ -195,9 +199,13 @@ function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
   const [q, setQ] = useState("");
   const [group, setGroup] = useState(null);
   const query = q.trim().toLowerCase();
-  const match = r => r.cat === cat && (!group || GROUP_OF[r.diet] === group) && (!query || r.name.toLowerCase().includes(query));
+  // What may be picked here comes from slots.js, not from the recipe's spreadsheet category.
+  // A meal already planned in this slot is listed even when the rules no longer allow it there,
+  // so a plan made before a rule changed still shows what it holds instead of looking empty.
+  const match = r => (!group || GROUP_OF[r.diet] === group) && (!query || r.name.toLowerCase().includes(query));
+  const planned = currentId && !allowedIn(byId[currentId], cat) ? byId[currentId] : null;
   const buckets = {};
-  RECIPES.filter(match).forEach(r => {
+  (planned ? [planned, ...SLOT_POOLS[cat]] : SLOT_POOLS[cat]).filter(match).forEach(r => {
     const b = Math.round(r.kcal / 100) * 100;
     (buckets[b] = buckets[b] || []).push(r);
   });
@@ -296,7 +304,11 @@ function RecipeModal({ recipe, onClose }) {
     .split("\n")
     .map(l => l.replace(/^\s*\d+[.)]\s*/, "").trim())
     .filter(Boolean);
-  const tint = CAT_TINT[recipe.cat];
+  // Badged with the slots the recipe may actually be served in, not with the category the
+  // spreadsheet filed it under — the two differ wherever slots.js narrows or widens it.
+  const slots = slotsOfId(recipe.id);
+  const shown = slots.length ? slots : [recipe.cat];
+  const tint = CAT_TINT[primarySlot(recipe)];
   const heroRadius = `${R_CARD}px ${R_CARD}px 0 0`;
   return (
     <div onClick={onClose} style={overlay(50)}>
@@ -305,7 +317,7 @@ function RecipeModal({ recipe, onClose }) {
           {imgErr ? (
             <div style={{ height: 200, borderRadius: heroRadius, background: tint.bg, color: tint.fg,
               display: "flex", alignItems: "center", justifyContent: "center", fontSize: 64, fontWeight: 700 }}>
-              {CAT_MARK[recipe.cat]}
+              {CAT_MARK[primarySlot(recipe)]}
             </div>
           ) : (
             <img src={recipe.img || `recipes/${recipe.id}.jpg`} alt={recipe.name} onError={() => setImgErr(true)}
@@ -319,7 +331,9 @@ function RecipeModal({ recipe, onClose }) {
 
         <div style={{ padding: "18px 22px 26px" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <span style={{ background: tint.bg, color: tint.fg, borderRadius: R_PILL, padding: "3px 10px", fontSize: 11.5, fontWeight: 700 }}>{recipe.cat}</span>
+            {shown.map(c => (
+              <span key={c} style={{ background: CAT_TINT[c].bg, color: CAT_TINT[c].fg, borderRadius: R_PILL, padding: "3px 10px", fontSize: 11.5, fontWeight: 700 }}>{c}</span>
+            ))}
             <span style={{ fontSize: 12.5, color: MUTED, ...NUM }}>
               {GROUP_OF[recipe.diet] ? `plan ${GROUP_OF[recipe.diet].label}, dz. ${recipe.day}` : "przepis własny"}{recipe.time ? ` · ok. ${recipe.time} min` : ""}
             </span>

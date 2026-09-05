@@ -45,6 +45,8 @@ bundled).
 - `src/ui.jsx` — the design tokens, date helpers and the pieces both tabs import: `Segmented`,
   `SwipeRow`, `UndoToast`, `Icon` with its `P_*` paths, and the number/plural formatters. Anything
   used by more than one tab belongs here.
+- `src/slots.js` — `CATS` (the four meal slots) and the rules deciding which recipe may be served in
+  which of them (see "Allowed meal slots" below).
 
 Styling is inline `style={}` objects throughout, on a calm iOS-flavoured system defined as constants
 in `src/ui.jsx`. Match it rather than introducing a CSS/styling system:
@@ -96,8 +98,14 @@ Together they are ~340 kB of source that ships eagerly in the main bundle:
   `Śniadanie`/`Obiad`/`Kolacja`/`Przekąska`, 70 recipes each; `port` ∈ {1,2,4,5}; `ing[].g` is grams
   used for shopping-list math; `img` is an optional explicit photo URL — currently no recipe sets it).
 - `categories.js` — exports `ING_CAT`, a map of normalized ingredient name → shopping category
-  (`Warzywa`, `Nabiał i jajka`, etc.), used to group the shopping list. It currently covers 100% of
-  the 306 distinct `aggKey(...)` values produced by `RECIPES` — nothing falls through to `Inne`.
+  (`Warzywa`, `Nabiał i jajka`, etc.), used to group the shopping list. It has 305 entries covering
+  every `aggKey(...)` value `RECIPES` produces except `"woda"`, which falls through to `Inne` (as do
+  `"odżywka białkowa"` and `"ciasto do naleśników low fodmap"`, mapped there explicitly).
+  Its header comment lists the **manual corrections** made on top of the generated data — fresh herbs
+  and root aromatics (bazylia, kolendra, koper, mięta, natka pietruszki, szczypiorek, tymianek,
+  imbir) moved out of `Warzywa` into `Przyprawy`, so they sit beside their dried counterparts on the
+  shopping list. Re-apply them after any regeneration from the spreadsheet; `czosnek`,
+  `papryczka chilli` and `cebula dymka` are deliberately left in `Warzywa`.
 - `instructions.js` — exports `STEPS`, a map of recipe `id` (string key) → newline-separated prep
   instructions. All 280 recipes have steps.
 
@@ -137,6 +145,37 @@ in its modal; a recipe with no `diet` falls back to "własny"/"przepis własny".
 
 All of it is derived at module load, so regenerating `recipes.js` with different diets or calorie
 levels re-groups the UI automatically — nothing here hardcodes "Dieta N" or a kcal number.
+
+### Allowed meal slots (`src/slots.js`)
+
+A recipe's `cat` is where the **spreadsheet filed it**, not the only slot it belongs in. The base
+mixes the two ends of the day deliberately — breakfast-shaped dishes sit in `Kolacja` and vice
+versa — so "what may be picked in this slot" is a separate, hand-maintained decision. `slots.js`
+holds it, and unlike `data/*.js` it is **source, never regenerated**: edits survive a new export
+from the Excel base.
+
+- `slotsOf(r)` resolves a recipe to its allowed slots, always in `CATS` order and never empty:
+  `SLOT_OVERRIDES[r.id]` first, then the first matching entry in `SLOT_RULES`, else `[r.cat]` —
+  so the default is "exactly where the base filed it" and nothing changes until a rule says so.
+  Rules can narrow *or* widen; an override or rule leaving nothing valid falls back to `[r.cat]`.
+- **Rules match on the recipe name, not its id**, because ids are positional and shift when
+  `recipes.js` is regenerated while names stay. `SLOT_OVERRIDES` is keyed by id precisely because
+  it is the escape hatch for one-offs — re-check it after a regeneration.
+- `SLOTS_BY_ID` and `SLOT_POOLS` (slot → recipes) are resolved once at load. `PickerModal` lists
+  `SLOT_POOLS[cat]` and `POOLS` (the "Wylosuj dzień" draw) is built from it, so both agree by
+  construction. If a rule ever emptied a slot the draw would break on `Math.min(...[])`, so an
+  empty pool falls back to the base's own filing and warns.
+- Display follows the slots, not `cat`: `primarySlot(r)` drives the thumbnail placeholder and the
+  hero tint, and `RecipeModal` badges **every** allowed slot (one pill each). A recipe whose slots
+  are just `[r.cat]` — 266 of the 280 — looks exactly as it did before.
+- A meal already planned in a slot the rules no longer allow **stays listed** in that slot's picker
+  (`planned` in `PickerModal`) and keeps rendering in the day panel. Narrowing a rule never silently
+  empties somebody's saved plan; it only stops the recipe being offered there again.
+
+The one rule shipped today is `owsianki`: `/owsiank|owsianc|jaglank/i` → `["Śniadanie"]`, which moves
+14 porridges out of `Kolacja` (pools become Śniadanie 84 / Obiad 70 / Kolacja 56 / Przekąska 70).
+It matches the noun only — "Bułka owsiana z łososiem" and "Mintaj w płatkach owsianych" are not
+porridge and stay put.
 
 ### Recipe photos
 
@@ -399,8 +438,10 @@ a half-ticked list belongs to the phone in the shop, not to every device).
 
 `drawDay` replaced the old "sample 500 random combos" draw with weighted sampling over a precomputed
 table of how many days reach each kcal total (`SUMS`), which makes a draw uniform over every day
-within tolerance. Verified against an exhaustive count: 11,689,399 fitting days at a 2400 goal,
-268,076 at 2700, and the draw's distribution passes a chi-square goodness-of-fit test at both. The
+within tolerance. Verified against an exhaustive count: 11,315,777 fitting days at a 2400 goal and
+246,899 at 2700 (11,689,399 / 268,076 before `slots.js` narrowed the `Kolacja` pool; the draw's
+span is still 2256–2787 kcal), and the draw's distribution passes a chi-square goodness-of-fit test
+at both. The
 tolerance widens from 50 kcal only when nothing fits, so out-of-range goals still return a full day.
 Drawing across all five diets is deliberate — see the comment above `POOLS`.
 
