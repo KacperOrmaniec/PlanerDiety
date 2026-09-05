@@ -4,8 +4,8 @@
   "description": "Kalendarz posiłków i lista zakupów",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#EFE7D8",
-  "theme_color": "#141210",
+  "background_color": "#F4F4F7",
+  "theme_color": "#FFFFFF",
   "icons": [
     {
       "src": "/icon-192.png",

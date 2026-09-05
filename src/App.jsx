@@ -4,34 +4,33 @@ import { STEPS } from "./data/instructions.js";
 import { ING_CAT } from "./data/categories.js";
 import { supabase } from "./lib/supabaseClient.js";
 
-// --- Design tokens -------------------------------------------------------
-// Warm brutalism: cream paper, heavy ink rules, flat saturated color, hard
-// offset shadows instead of blur, square corners, no decorative emoji.
-const INK = "#141210";
-const CREAM = "#EFE7D8";
-const PAPER = "#FBF7EE";
-const RED = "#E2452F";
-const MUTED = "#6E6656";
-const RULE = `2px solid ${INK}`;
-const RULE_THIN = `1.5px solid ${INK}`;
-const RULE_THICK = `3px solid ${INK}`;
-const HARD = `5px 5px 0 ${INK}`;
-const HARD_SM = `3px 3px 0 ${INK}`;
-const SANS = "'Bricolage Grotesque', system-ui, sans-serif";
-const MONO = "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace";
+import {
+  FONT, GREEN, GREEN_DEEP, GREEN_SOFT, GREEN_GLOW, BG, CARD, INK, INK_SOFT, MUTED, LINE, FILL,
+  AMBER, AMBER_SOFT, AMBER_DEEP, RED, RED_SOFT, RED_DEEP, R_CARD, R_CTRL, R_PILL, SHADOW_SM, NUM,
+  MONTHS, DOW, pad, keyOf, fmtPL, dowOf, plural,
+  caption, sectionLabel, cardStyle, listBox, iconBtn, pillBtn, overlay, sheet, Segmented,
+  P_CHEVRON, P_BACK, P_CLOSE, P_CHECK, P_PLUS, P_SEARCH, Icon,
+} from "./ui.jsx";
+import Progress from "./Progress.jsx";
 
 const CATS = ["Śniadanie", "Obiad", "Kolacja", "Przekąska"];
-const CAT_COLORS = { "Śniadanie": "#F0A202", "Obiad": "#0F8B5F", "Kolacja": "#3D4FD1", "Przekąska": "#D6336C" };
+// Category colours deliberately avoid green, so a coloured dot never reads as "on target".
+const CAT_COLORS = { "Śniadanie": "#FF9F0A", "Obiad": "#30B0C7", "Kolacja": "#5E5CE6", "Przekąska": "#FF375F" };
+const CAT_TINT = {
+  "Śniadanie": { bg: "#FFF3E0", fg: "#A05C00" },
+  "Obiad": { bg: "#E4F5F9", fg: "#0B6E86" },
+  "Kolacja": { bg: "#EDECFE", fg: "#4340C0" },
+  "Przekąska": { bg: "#FFE8EE", fg: "#C4103C" },
+};
 const CAT_MARK = { "Śniadanie": "Ś", "Obiad": "O", "Kolacja": "K", "Przekąska": "P" };
-const MONTHS = ["Styczeń","Luty","Marzec","Kwiecień","Maj","Czerwiec","Lipiec","Sierpień","Wrzesień","Październik","Listopad","Grudzień"];
-const DOW = ["Pn","Wt","Śr","Cz","Pt","So","Nd"];
+const MACROS = [
+  { key: "p", mark: "B", fg: "#4340C0", bg: "#EDECFE" },
+  { key: "f", mark: "T", fg: "#A05C00", bg: "#FFF3E0" },
+  { key: "c", mark: "W", fg: "#0B6E86", bg: "#E4F5F9" },
+];
 
 const byId = {};
 RECIPES.forEach(r => { byId[r.id] = r; });
-
-const pad = n => String(n).padStart(2, "0");
-const keyOf = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-const fmtPL = k => { const [y,m,d] = k.split("-"); return `${parseInt(d)} ${MONTHS[parseInt(m)-1].toLowerCase()} ${y}`; };
 
 function aggKey(name){
   let s = name.trim().toLowerCase();
@@ -45,41 +44,34 @@ const SHOP_CATS = ["Warzywa", "Owoce", "Pieczywo", "Nabiał i jajka", "Mięso i 
 
 function fmtG(g){ return g >= 1000 ? `${(g/1000).toFixed(g % 1000 === 0 ? 0 : 2)} kg` : `${Math.round(g*10)/10} g`; }
 
-// Shared building blocks -------------------------------------------------
-const label = (extra = {}) => ({
-  fontSize: 11, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase",
-  fontFamily: SANS, color: INK, ...extra
-});
-
 function MacroChips({ r, size }) {
   const s = size === "sm";
-  const pad = s ? "1px 5px" : "3px 8px";
-  const fs = s ? 10 : 11.5;
-  const macro = (letter, val, color) => (
-    <span style={{ background: PAPER, border: RULE_THIN, padding: pad, fontSize: fs, fontFamily: MONO, fontWeight: 500, color: INK, whiteSpace: "nowrap" }}>
-      <b style={{ color, fontWeight: 700 }}>{letter}</b> {val}
-    </span>
-  );
+  const padding = s ? "2px 8px" : "4px 10px";
+  const fs = s ? 11 : 12.5;
   return (
-    <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
-      <span style={{ background: INK, color: CREAM, border: RULE_THIN, padding: pad, fontSize: fs, fontFamily: MONO, fontWeight: 700, whiteSpace: "nowrap" }}>{r.kcal} KCAL</span>
-      {macro("B", r.p, "#0F8B5F")}
-      {macro("T", r.f, "#F0A202")}
-      {macro("W", r.c, "#3D4FD1")}
+    <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center" }}>
+      <span style={{ background: INK, color: "#fff", borderRadius: R_PILL, padding, fontSize: fs, fontWeight: 600, whiteSpace: "nowrap", ...NUM }}>
+        {r.kcal} kcal
+      </span>
+      {MACROS.map(m => (
+        <span key={m.mark} style={{ background: m.bg, color: m.fg, borderRadius: R_PILL, padding, fontSize: fs, fontWeight: 600, whiteSpace: "nowrap", ...NUM }}>
+          {m.mark} {r[m.key]}
+        </span>
+      ))}
     </div>
   );
 }
 
-function RecipeThumb({ r, size }) {
+function RecipeThumb({ r, size, radius = 12 }) {
   const [err, setErr] = useState(false);
-  const src = r.img || `recipes/${r.id}.jpg`;
+  const box = { width: size, height: size, borderRadius: radius, flexShrink: 0, display: "block" };
   if (err) return (
-    <div style={{ width: size, height: size, background: CAT_COLORS[r.cat], border: RULE, flexShrink: 0,
+    <div style={{ ...box, background: CAT_TINT[r.cat].bg, color: CAT_TINT[r.cat].fg,
       display: "flex", alignItems: "center", justifyContent: "center",
-      fontFamily: SANS, fontSize: Math.round(size*0.46), fontWeight: 800, color: "#fff" }}>{CAT_MARK[r.cat]}</div>
+      fontSize: Math.round(size * 0.4), fontWeight: 700 }}>{CAT_MARK[r.cat]}</div>
   );
-  return <img src={src} alt="" loading="lazy" onError={() => setErr(true)}
-    style={{ width: size, height: size, border: RULE, objectFit: "cover", flexShrink: 0, background: CREAM, display: "block" }} />;
+  return <img src={r.img || `recipes/${r.id}.jpg`} alt="" loading="lazy" onError={() => setErr(true)}
+    style={{ ...box, objectFit: "cover", background: FILL, boxShadow: `inset 0 0 0 1px ${LINE}` }} />;
 }
 
 // "Wylosuj dzień": pick one recipe per category summing to within tolerance of the day's goal.
@@ -191,12 +183,7 @@ DIET_GROUPS.forEach(g => g.diets.forEach(d => { GROUP_OF[d] = g; }));
 const TARGETS = [2400, 2500, 2600, 2700];
 const DEFAULT_GOALS = { global: 2400, days: {} };
 
-const closeBtn = {
-  border: RULE, background: PAPER, color: INK, width: 34, height: 34,
-  fontSize: 17, fontWeight: 700, cursor: "pointer", flexShrink: 0, lineHeight: 1, fontFamily: SANS
-};
-
-// Rendered only while open (and therefore remounted on every open), so the search box and diet
+// Rendered only while open (and therefore remounted on every open), so the search box and plan
 // filter always start empty instead of carrying over from the last category that was picked.
 function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
   const [q, setQ] = useState("");
@@ -210,65 +197,79 @@ function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
   });
   const groups = Object.keys(buckets).map(Number).sort((a, b) => a - b)
     .map(b => ({ label: `~${b} kcal`, items: buckets[b].slice().sort((x, y) => x.kcal - y.kcal || x.name.localeCompare(y.name, "pl")) }));
-  const chipStyle = active => ({
-    border: RULE, background: active ? INK : PAPER, color: active ? CREAM : INK,
-    padding: "6px 11px", fontSize: 11.5, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap",
-    textTransform: "uppercase", letterSpacing: 0.6, fontFamily: SANS
-  });
+
   return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(20,18,16,0.55)", zIndex: 40, display: "flex", alignItems: "center", justifyContent: "center", padding: "calc(16px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom))" }}>
-      <div onClick={e => e.stopPropagation()} style={{ background: PAPER, border: RULE_THICK, maxWidth: 540, width: "100%", maxHeight: "88dvh", display: "flex", flexDirection: "column", boxShadow: HARD, overflow: "hidden" }}>
-        <div style={{ padding: "16px 18px 14px", borderBottom: RULE, background: CREAM }}>
+    <div onClick={onClose} style={overlay(40)}>
+      <div onClick={e => e.stopPropagation()} style={{ ...sheet, maxWidth: 560, maxHeight: "88dvh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ padding: "16px 18px 14px", borderBottom: `1px solid ${LINE}` }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-            <h2 style={{ fontFamily: SANS, fontSize: 19, fontWeight: 800, margin: 0, color: INK, textTransform: "uppercase", letterSpacing: -0.3 }}>
-              <span style={{ background: CAT_COLORS[cat], color: "#fff", border: RULE_THIN, padding: "1px 7px", marginRight: 8, fontSize: 15 }}>{CAT_MARK[cat]}</span>
+            <h2 style={{ fontSize: 19, fontWeight: 700, margin: 0, letterSpacing: -0.4, display: "flex", alignItems: "center", gap: 9 }}>
+              <span style={{ width: 10, height: 10, borderRadius: R_PILL, background: CAT_COLORS[cat] }} />
               {cat}
             </h2>
-            <button onClick={onClose} className="b" style={closeBtn}>×</button>
+            <button onClick={onClose} className="press" aria-label="Zamknij" style={iconBtn}>
+              <Icon d={P_CLOSE} size={15} color={INK_SOFT} stroke={2.2} />
+            </button>
           </div>
+
           {ctx && ctx.filled > 0 && (
-            <div style={{ marginTop: 10, background: PAPER, border: RULE_THIN, padding: "7px 10px", fontSize: 11.5, color: INK, fontFamily: MONO }}>
-              Reszta dnia <b>{ctx.others}</b> · cel <b>{ctx.goal}</b> · zostaje <b style={{ color: RED }}>~{ctx.remaining} kcal</b>
+            <div style={{ marginTop: 12, background: GREEN_SOFT, borderRadius: R_CTRL, padding: "10px 12px", fontSize: 13, color: INK_SOFT, ...NUM }}>
+              Reszta dnia <b style={{ color: INK, fontWeight: 600 }}>{ctx.others}</b> · cel <b style={{ color: INK, fontWeight: 600 }}>{ctx.goal}</b> · zostaje{" "}
+              <b style={{ color: GREEN_DEEP, fontWeight: 700 }}>~{ctx.remaining} kcal</b>
             </div>
           )}
-          <input value={q} onChange={e => setQ(e.target.value)} placeholder="Szukaj po nazwie…" autoFocus
-            style={{ width: "100%", boxSizing: "border-box", marginTop: 10, padding: "9px 11px", border: RULE, background: PAPER, fontSize: 14, fontFamily: SANS, fontWeight: 500, color: INK }} />
-          <div style={{ display: "flex", gap: 5, marginTop: 9, flexWrap: "wrap", alignItems: "center" }}>
-            <span style={{ ...label(), color: MUTED, marginRight: 3 }}>Plan</span>
-            <button onClick={() => setGroup(null)} style={chipStyle(!group)}>Wszystkie</button>
+
+          <div style={{ position: "relative", marginTop: 12 }}>
+            <span style={{ position: "absolute", left: 13, top: "50%", transform: "translateY(-50%)", display: "flex", pointerEvents: "none" }}>
+              <Icon d={P_SEARCH} size={16} color={MUTED} />
+            </span>
+            <input value={q} onChange={e => setQ(e.target.value)} placeholder="Szukaj po nazwie…" autoFocus
+              style={{ width: "100%", boxSizing: "border-box", padding: "11px 12px 11px 38px", borderRadius: R_CTRL,
+                border: `1px solid ${LINE}`, background: FILL, fontSize: 14.5, fontWeight: 500, color: INK }} />
+          </div>
+
+          <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <span style={caption({ marginRight: 2 })}>Plan</span>
+            <button onClick={() => setGroup(null)} className="press" style={pillBtn(!group)}>Wszystkie</button>
             {DIET_GROUPS.map(g => (
-              <button key={g.label} onClick={() => setGroup(g === group ? null : g)} style={chipStyle(g === group)}>{g.label}</button>
+              <button key={g.label} onClick={() => setGroup(g === group ? null : g)} className="press" style={pillBtn(g === group)}>{g.label}</button>
             ))}
           </div>
         </div>
-        <div style={{ overflowY: "auto", padding: "0 14px 16px" }}>
+
+        <div style={{ overflowY: "auto", padding: "0 12px 16px" }}>
           {currentId && (
-            <button onClick={() => onPick(null)} className="b" style={{ width: "100%", border: RULE, background: PAPER, boxShadow: HARD_SM, padding: "10px 12px", fontSize: 12, color: INK, fontWeight: 700, cursor: "pointer", margin: "14px 0 4px", textTransform: "uppercase", letterSpacing: 0.6, fontFamily: SANS }}>
-              × Usuń posiłek z tego dnia
-            </button>
+            <button onClick={() => onPick(null)} className="press" style={{
+              width: "100%", border: `1px solid ${LINE}`, background: CARD, borderRadius: R_CTRL,
+              padding: "11px 12px", fontSize: 13.5, color: RED_DEEP, fontWeight: 600, cursor: "pointer", margin: "14px 0 2px"
+            }}>Usuń posiłek z tego dnia</button>
           )}
           {groups.map(g => (
             <div key={g.label}>
-              <div style={{ position: "sticky", top: 0, zIndex: 1, background: PAPER, borderBottom: RULE, ...label(), fontSize: 11.5, padding: "14px 0 5px", fontFamily: MONO, fontWeight: 700 }}>{g.label}</div>
+              <div style={{ position: "sticky", top: 0, zIndex: 1, background: CARD, ...sectionLabel(), padding: "16px 4px 8px" }}>{g.label}</div>
               {g.items.map(r => {
                 const isSel = r.id === currentId;
                 const fits = ctx && ctx.filled === CATS.length - 1 && Math.abs(r.kcal - ctx.remaining) <= 60;
                 return (
                   <div key={r.id} onClick={() => onPick(r.id)} role="button" tabIndex={0}
                     onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPick(r.id); } }}
-                    style={{ display: "flex", gap: 11, alignItems: "center", padding: "9px 8px", cursor: "pointer",
-                      background: isSel ? CAT_COLORS[cat] + "22" : "transparent",
-                      border: isSel ? RULE : "2px solid transparent", marginTop: 6 }}>
-                    <RecipeThumb key={r.id} r={r} size={58} />
+                    className="row press"
+                    style={{ display: "flex", gap: 12, alignItems: "center", padding: "10px", cursor: "pointer",
+                      borderRadius: R_CTRL, background: isSel ? GREEN_SOFT : "transparent", marginTop: 2 }}>
+                    <RecipeThumb key={r.id} r={r} size={54} />
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 14, fontWeight: 700, color: INK, lineHeight: 1.25, fontFamily: SANS }}>{r.name}</div>
-                      <div style={{ fontSize: 11, color: MUTED, marginTop: 4, fontFamily: MONO, lineHeight: 1.5 }}>
-                        <b style={{ color: INK }}>{r.kcal} kcal</b> · B {r.p} · T {r.f} · W {r.c}{r.time ? ` · ${r.time} min` : ""}{GROUP_OF[r.diet] ? ` · plan ${GROUP_OF[r.diet].kcal}` : " · własny"}
+                      <div className="clamp2" style={{ fontSize: 14.5, fontWeight: 600, color: INK, lineHeight: 1.3 }}>{r.name}</div>
+                      <div className="ellip" style={{ fontSize: 12.5, color: MUTED, marginTop: 4, lineHeight: 1.45, ...NUM }}>
+                        <b style={{ color: INK_SOFT, fontWeight: 600 }}>{r.kcal} kcal</b> · B {r.p} · T {r.f} · W {r.c}{group ? "" : GROUP_OF[r.diet] ? ` · plan ${GROUP_OF[r.diet].kcal}` : " · własny"}{r.time ? ` · ${r.time} min` : ""}
                       </div>
                     </div>
-                    {fits && <span style={{ background: RED, color: "#fff", border: RULE_THIN, padding: "2px 7px", fontSize: 10, fontWeight: 700, flexShrink: 0, textTransform: "uppercase", letterSpacing: 0.5, fontFamily: SANS }}>Pasuje</span>}
-                    <button onClick={e => { e.stopPropagation(); onPreview(r); }} title="Zobacz przepis"
-                      style={{ border: RULE_THIN, background: PAPER, padding: "5px 9px", fontSize: 10.5, fontWeight: 700, color: INK, cursor: "pointer", flexShrink: 0, textTransform: "uppercase", letterSpacing: 0.5, fontFamily: SANS }}>
+                    {fits && (
+                      <span style={{ background: GREEN_SOFT, color: GREEN_DEEP, borderRadius: R_PILL, padding: "3px 10px", fontSize: 11.5, fontWeight: 700, flexShrink: 0 }}>Pasuje</span>
+                    )}
+                    {isSel && <Icon d={P_CHECK} size={17} color={GREEN_DEEP} stroke={2.4} />}
+                    <button onClick={e => { e.stopPropagation(); onPreview(r); }} title="Zobacz przepis" className="press"
+                      style={{ border: `1px solid ${LINE}`, background: CARD, borderRadius: R_PILL, padding: "6px 12px",
+                        fontSize: 12, fontWeight: 600, color: INK_SOFT, cursor: "pointer", flexShrink: 0 }}>
                       Przepis
                     </button>
                   </div>
@@ -276,7 +277,7 @@ function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
               })}
             </div>
           ))}
-          {!groups.length && <div style={{ color: MUTED, fontSize: 13, textAlign: "center", padding: "26px 0", fontFamily: SANS }}>Brak przepisów dla tych filtrów.</div>}
+          {!groups.length && <div style={{ color: MUTED, fontSize: 14, textAlign: "center", padding: "36px 0" }}>Brak przepisów dla tych filtrów.</div>}
         </div>
       </div>
     </div>
@@ -284,57 +285,77 @@ function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
 }
 
 function RecipeModal({ recipe, onClose }) {
+  const [imgErr, setImgErr] = useState(false);
   const steps = (STEPS[recipe.id] || "")
     .split("\n")
     .map(l => l.replace(/^\s*\d+[.)]\s*/, "").trim())
     .filter(Boolean);
+  const tint = CAT_TINT[recipe.cat];
+  const heroRadius = `${R_CARD}px ${R_CARD}px 0 0`;
   return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(20,18,16,0.55)", zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: "calc(16px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom))" }}>
-      <div onClick={e => e.stopPropagation()} style={{ background: PAPER, border: RULE_THICK, maxWidth: 560, width: "100%", maxHeight: "85dvh", overflowY: "auto", padding: "22px 22px 26px", boxShadow: HARD }}>
-        <img key={recipe.id} src={recipe.img || `recipes/${recipe.id}.jpg`} alt={recipe.name}
-          onError={e => { e.target.style.display = "none"; }}
-          style={{ width: "calc(100% + 44px)", margin: "-22px -22px 16px", height: 200, objectFit: "cover", display: "block", borderBottom: RULE_THICK }} />
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
-          <div>
-            <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
-              <span style={{ background: CAT_COLORS[recipe.cat], border: RULE_THIN, padding: "2px 8px", ...label({ color: "#fff", fontSize: 10 }) }}>{recipe.cat}</span>
-              <span style={{ fontSize: 10.5, color: MUTED, fontFamily: MONO }}>{GROUP_OF[recipe.diet] ? `plan ${GROUP_OF[recipe.diet].label}, dz. ${recipe.day}` : "przepis własny"}{recipe.time ? ` · ok. ${recipe.time} min` : ""}</span>
+    <div onClick={onClose} style={overlay(50)}>
+      <div onClick={e => e.stopPropagation()} style={{ ...sheet, maxWidth: 580, maxHeight: "88dvh", overflowY: "auto" }}>
+        <div style={{ position: "relative" }}>
+          {imgErr ? (
+            <div style={{ height: 200, borderRadius: heroRadius, background: tint.bg, color: tint.fg,
+              display: "flex", alignItems: "center", justifyContent: "center", fontSize: 64, fontWeight: 700 }}>
+              {CAT_MARK[recipe.cat]}
             </div>
-            <h2 style={{ fontFamily: SANS, fontSize: 25, fontWeight: 800, margin: "8px 0 12px", color: INK, lineHeight: 1.1, letterSpacing: -0.6 }}>{recipe.name}</h2>
-          </div>
-          <button onClick={onClose} className="b" style={closeBtn}>×</button>
+          ) : (
+            <img src={recipe.img || `recipes/${recipe.id}.jpg`} alt={recipe.name} onError={() => setImgErr(true)}
+              style={{ width: "100%", height: 210, objectFit: "cover", display: "block", borderRadius: heroRadius, background: FILL }} />
+          )}
+          <button onClick={onClose} className="press" aria-label="Zamknij"
+            style={{ ...iconBtn, position: "absolute", top: 14, right: 14, background: "rgba(255,255,255,.92)", boxShadow: SHADOW_SM }}>
+            <Icon d={P_CLOSE} size={15} color={INK} stroke={2.2} />
+          </button>
         </div>
-        <MacroChips r={recipe} />
-        {recipe.port > 1 && (
-          <div style={{ marginTop: 14, background: "#F0A202", border: RULE, padding: "8px 11px", fontSize: 12.5, color: INK, fontWeight: 600, fontFamily: SANS }}>
-            Przepis na {recipe.port} porcje — składniki dotyczą całego przepisu. Lista zakupów przelicza je na 1 porcję.
+
+        <div style={{ padding: "18px 22px 26px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ background: tint.bg, color: tint.fg, borderRadius: R_PILL, padding: "3px 10px", fontSize: 11.5, fontWeight: 700 }}>{recipe.cat}</span>
+            <span style={{ fontSize: 12.5, color: MUTED, ...NUM }}>
+              {GROUP_OF[recipe.diet] ? `plan ${GROUP_OF[recipe.diet].label}, dz. ${recipe.day}` : "przepis własny"}{recipe.time ? ` · ok. ${recipe.time} min` : ""}
+            </span>
           </div>
-        )}
-        {recipe.note && (
-          <div style={{ marginTop: 10, background: RED, border: RULE, padding: "8px 11px", fontSize: 12.5, color: "#fff", fontWeight: 600, fontFamily: SANS }}>{recipe.note}</div>
-        )}
-        <h3 style={{ ...label(), fontSize: 12, margin: "22px 0 0", borderBottom: RULE_THICK, paddingBottom: 5 }}>Składniki</h3>
-        <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-          {recipe.ing.map((i, idx) => (
-            <li key={idx} style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "8px 0", borderBottom: `1px solid ${INK}22`, fontSize: 13.5, fontFamily: SANS }}>
-              <span style={{ color: INK }}>{i.n}</span>
-              <span style={{ color: MUTED, textAlign: "right", flexShrink: 0, fontFamily: MONO, fontSize: 12 }}>{i.d}</span>
-            </li>
-          ))}
-        </ul>
-        {steps.length > 0 && (
-          <>
-            <h3 style={{ ...label(), fontSize: 12, margin: "24px 0 0", borderBottom: RULE_THICK, paddingBottom: 5 }}>Przygotowanie</h3>
-            <ol style={{ listStyle: "none", padding: 0, margin: 0 }}>
-              {steps.map((s, idx) => (
-                <li key={idx} style={{ display: "flex", gap: 11, alignItems: "flex-start", padding: "10px 0", borderBottom: idx < steps.length-1 ? `1px solid ${INK}22` : "none" }}>
-                  <span style={{ flexShrink: 0, width: 22, height: 22, background: INK, color: CREAM, fontSize: 11.5, fontWeight: 700, fontFamily: MONO, display: "flex", alignItems: "center", justifyContent: "center" }}>{idx+1}</span>
-                  <span style={{ fontSize: 13.5, color: INK, lineHeight: 1.5, fontFamily: SANS }}>{s}</span>
-                </li>
-              ))}
-            </ol>
-          </>
-        )}
+          <h2 style={{ fontSize: 25, fontWeight: 700, margin: "10px 0 14px", color: INK, lineHeight: 1.15, letterSpacing: -0.7 }}>{recipe.name}</h2>
+          <MacroChips r={recipe} />
+
+          {recipe.port > 1 && (
+            <div style={{ marginTop: 14, background: AMBER_SOFT, color: AMBER_DEEP, borderRadius: R_CTRL, padding: "11px 13px", fontSize: 13, fontWeight: 500, lineHeight: 1.55 }}>
+              Przepis na {recipe.port} {plural(recipe.port, "porcję", "porcje", "porcji")} — składniki dotyczą całego przepisu. Lista zakupów przelicza je na 1 porcję.
+            </div>
+          )}
+          {recipe.note && (
+            <div style={{ marginTop: 10, background: RED_SOFT, color: RED_DEEP, borderRadius: R_CTRL, padding: "11px 13px", fontSize: 13, fontWeight: 500, lineHeight: 1.55 }}>{recipe.note}</div>
+          )}
+
+          <h3 style={{ ...sectionLabel(), margin: "24px 0 8px" }}>Składniki</h3>
+          <ul style={{ ...listBox, listStyle: "none", padding: 0, margin: 0 }}>
+            {recipe.ing.map((i, idx) => (
+              <li key={idx} style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "11px 14px",
+                borderTop: idx ? `1px solid ${LINE}` : "none", fontSize: 14, color: INK }}>
+                <span>{i.n}</span>
+                <span style={{ color: MUTED, textAlign: "right", flexShrink: 0, fontSize: 13, ...NUM }}>{i.d}</span>
+              </li>
+            ))}
+          </ul>
+
+          {steps.length > 0 && (
+            <>
+              <h3 style={{ ...sectionLabel(), margin: "26px 0 6px" }}>Przygotowanie</h3>
+              <ol style={{ listStyle: "none", padding: 0, margin: 0 }}>
+                {steps.map((s, idx) => (
+                  <li key={idx} style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: "10px 0" }}>
+                    <span style={{ flexShrink: 0, width: 24, height: 24, borderRadius: R_PILL, background: GREEN_SOFT,
+                      color: GREEN_DEEP, fontSize: 12.5, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", ...NUM }}>{idx + 1}</span>
+                    <span style={{ fontSize: 14, color: INK_SOFT, lineHeight: 1.6 }}>{s}</span>
+                  </li>
+                ))}
+              </ol>
+            </>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -709,95 +730,95 @@ export default function App({ session }) {
   const sel = plan[selected] || {};
   const totals = dayTotals(selected);
 
-  const card = { background: PAPER, border: RULE_THICK, boxShadow: HARD, padding: 16 };
-  const selectStyle = { width: "100%", boxSizing: "border-box", padding: "8px 10px", border: RULE, background: PAPER, fontSize: 13, color: INK, fontFamily: MONO };
+  const dateInput = {
+    width: "100%", boxSizing: "border-box", padding: "11px 12px", borderRadius: R_CTRL,
+    border: `1px solid ${LINE}`, background: FILL, fontSize: 14.5, fontWeight: 500, color: INK, ...NUM
+  };
+  const linkBtn = { border: "none", background: "none", color: INK_SOFT, fontSize: 12.5, fontWeight: 600, cursor: "pointer", padding: "4px 2px" };
 
   return (
-    <div style={{ minHeight: "100dvh", background: CREAM, fontFamily: SANS, color: INK }}>
+    <div style={{ minHeight: "100dvh", background: BG, fontFamily: FONT, color: INK, WebkitFontSmoothing: "antialiased" }}>
       <style>{`
-        button { font-family: inherit; border-radius: 0; }
-        input, select { border-radius: 0; }
-        select:focus, input:focus, button:focus-visible { outline: 3px solid ${RED}; outline-offset: 2px; }
-        .b { transition: transform .07s ease, box-shadow .07s ease; }
-        .b:active { transform: translate(3px, 3px); box-shadow: none !important; }
-        @media (max-width: 760px) {
-          main > div[style*="grid-template-columns"] { grid-template-columns: 1fr !important; }
+        * { -webkit-tap-highlight-color: transparent; }
+        button, input, textarea, select { font-family: inherit; }
+        button { color: inherit; }
+        input:focus-visible, button:focus-visible, [role="button"]:focus-visible {
+          outline: 2px solid ${GREEN}; outline-offset: 2px;
         }
+        .press { transition: transform .14s cubic-bezier(.2,.8,.3,1), background-color .14s ease, box-shadow .14s ease, border-color .14s ease; }
+        .press:active { transform: scale(.978); }
+        .row { transition: background-color .14s ease; }
+        .clamp2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        .ellip { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        @media (hover: hover) { .row:hover { background: #FAFAFB; } }
+        @media (max-width: 880px) { .split { grid-template-columns: 1fr !important; } }
       `}</style>
 
-      <header style={{ background: INK, color: CREAM, padding: "calc(16px + env(safe-area-inset-top)) 16px 0", borderBottom: RULE_THICK }}>
+      <header style={{
+        position: "sticky", top: 0, zIndex: 30, background: "rgba(255,255,255,.82)",
+        backdropFilter: "saturate(180%) blur(20px)", WebkitBackdropFilter: "saturate(180%) blur(20px)",
+        borderBottom: `1px solid ${LINE}`, padding: "calc(14px + env(safe-area-inset-top)) 16px 12px"
+      }}>
         <div style={{ maxWidth: 1060, margin: "0 auto" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", justifyContent: "space-between" }}>
-            <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap" }}>
-              <h1 style={{ fontFamily: SANS, fontSize: 27, fontWeight: 800, margin: 0, letterSpacing: -0.8, textTransform: "uppercase" }}>Planer diety</h1>
-              <span style={{ fontSize: 11, color: "#A8A092", fontFamily: MONO }}>{RECIPES.length} przepisów · cel {goals.global} kcal</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, justifyContent: "space-between" }}>
+            <div style={{ minWidth: 0 }}>
+              <h1 style={{ fontSize: 22, fontWeight: 700, margin: 0, letterSpacing: -0.5 }}>Planer diety</h1>
+              <div style={{ ...caption({ marginTop: 2 }), ...NUM }}>{RECIPES.length} {plural(RECIPES.length, "przepis", "przepisy", "przepisów")} · cel {goals.global} kcal</div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
               {unsaved && (
                 <span title="Zmiany są zapisane w tej przeglądarce i zostaną wysłane na serwer, gdy tylko się uda."
-                  style={{ background: "#F0A202", color: INK, border: `2px solid ${CREAM}`, padding: "2px 8px", fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.6, fontFamily: SANS }}>
-                  {online ? "Zapisywanie…" : "Offline — zapiszę później"}
+                  style={{ display: "inline-flex", alignItems: "center", gap: 6, background: AMBER_SOFT, color: AMBER_DEEP,
+                    borderRadius: R_PILL, padding: "5px 11px", fontSize: 12, fontWeight: 600, whiteSpace: "nowrap" }}>
+                  <span style={{ width: 6, height: 6, borderRadius: R_PILL, background: AMBER }} />
+                  {online ? "Zapisywanie…" : "Offline"}
                 </span>
               )}
+              <button onClick={() => supabase.auth.signOut()} title={user.email} className="press"
+                style={{ border: `1px solid ${LINE}`, background: CARD, color: INK_SOFT, borderRadius: R_PILL,
+                  padding: "7px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Wyloguj</button>
             </div>
-            <button onClick={() => supabase.auth.signOut()} title={user.email} style={{
-              border: `2px solid ${CREAM}`, background: "none", color: CREAM,
-              padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer",
-              textTransform: "uppercase", letterSpacing: 0.8
-            }}>Wyloguj</button>
           </div>
-          <nav style={{ display: "flex", gap: 6, marginTop: 14 }}>
-            {[["cal","Kalendarz"],["shop","Lista zakupów"]].map(([id, lbl]) => (
-              <button key={id} onClick={() => setTab(id)} style={{
-                border: `2px solid ${CREAM}`, borderBottom: tab === id ? `2px solid ${PAPER}` : `2px solid ${CREAM}`,
-                cursor: "pointer", padding: "9px 16px", fontSize: 12, fontWeight: 700,
-                textTransform: "uppercase", letterSpacing: 0.8, marginBottom: -3,
-                background: tab === id ? PAPER : "transparent",
-                color: tab === id ? INK : CREAM
-              }}>{lbl}</button>
-            ))}
+          <nav style={{ marginTop: 12 }}>
+            <Segmented value={tab} onChange={setTab}
+              options={[["cal", "Kalendarz"], ["shop", "Lista zakupów"], ["progress", "Postępy"]]} />
           </nav>
         </div>
       </header>
 
-      <main style={{ maxWidth: 1060, margin: "0 auto", padding: "22px 16px calc(60px + env(safe-area-inset-bottom))" }}>
-        {loadState === "loading" && <div style={{ color: MUTED, fontSize: 13, fontFamily: MONO }}>Wczytywanie planu…</div>}
+      <main style={{ maxWidth: 1060, margin: "0 auto", padding: "20px 16px calc(60px + env(safe-area-inset-bottom))" }}>
+        {tab !== "progress" && loadState === "loading" && <div style={{ color: MUTED, fontSize: 14, padding: "8px 2px" }}>Wczytywanie planu…</div>}
 
-        {loadState === "error" && (
-          <section style={{ ...card, maxWidth: 560, margin: "0 auto" }}>
-            <h2 style={{ fontFamily: SANS, fontSize: 21, fontWeight: 800, margin: "0 0 10px", textTransform: "uppercase", letterSpacing: -0.5 }}>Nie udało się wczytać planu</h2>
-            <p style={{ fontSize: 13, color: MUTED, lineHeight: 1.6, margin: "0 0 16px", fontFamily: SANS }}>
+        {tab !== "progress" && loadState === "error" && (
+          <section style={{ ...cardStyle, maxWidth: 560, margin: "0 auto", padding: 22 }}>
+            <h2 style={{ fontSize: 20, fontWeight: 700, margin: "0 0 10px", letterSpacing: -0.4 }}>Nie udało się wczytać planu</h2>
+            <p style={{ fontSize: 14, color: INK_SOFT, lineHeight: 1.6, margin: "0 0 18px" }}>
               Twój plan jest bezpieczny — po prostu nie mamy do niego teraz dostępu. Edycja jest wyłączona,
               żeby przypadkiem nie nadpisać go pustym planem. {unsaved && "Niewysłane zmiany czekają w tej przeglądarce. "}
               Próbujemy ponownie automatycznie co 15 sekund.
             </p>
-            <button onClick={() => { setLoadState("loading"); loadPlan(); }} className="b" style={{
-              background: RED, color: "#fff", border: RULE, boxShadow: HARD_SM, padding: "11px 18px",
-              fontWeight: 700, fontSize: 12.5, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.8
+            <button onClick={() => { setLoadState("loading"); loadPlan(); }} className="press" style={{
+              background: GREEN, color: "#fff", border: "none", borderRadius: R_CTRL, padding: "12px 20px",
+              fontSize: 14.5, fontWeight: 600, cursor: "pointer", boxShadow: GREEN_GLOW
             }}>Spróbuj ponownie</button>
           </section>
         )}
 
         {tab === "cal" && loaded && (
-          <div style={{ display: "grid", gridTemplateColumns: "minmax(300px, 1.15fr) minmax(300px, 1fr)", gap: 20, alignItems: "start" }}>
+          <div className="split" style={{ display: "grid", gridTemplateColumns: "minmax(320px, 1.1fr) minmax(320px, 1fr)", gap: 18, alignItems: "start" }}>
             {/* DAY PANEL */}
-            <section style={card}>
-              <h2 style={{ fontFamily: SANS, fontSize: 23, fontWeight: 800, margin: "0 0 12px", textTransform: "uppercase", letterSpacing: -0.6, lineHeight: 1.05 }}>{fmtPL(selected)}</h2>
+            <section style={cardStyle}>
+              <div style={sectionLabel()}>{dowOf(selected)}</div>
+              <h2 style={{ fontSize: 24, fontWeight: 700, margin: "4px 0 16px", letterSpacing: -0.7, lineHeight: 1.1 }}>{fmtPL(selected)}</h2>
 
-              <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap", marginBottom: 12 }}>
-                <span style={{ ...label(), color: MUTED, marginRight: 3 }}>Cel</span>
-                {TARGETS.map(t => {
-                  const active = targetFor(selected) === t;
-                  return (
-                    <button key={t} onClick={() => setDayGoal(t)} style={{
-                      border: RULE, background: active ? RED : PAPER, color: active ? "#fff" : INK,
-                      padding: "4px 9px", fontSize: 11.5, fontWeight: 700, cursor: "pointer", fontFamily: MONO
-                    }}>{t}</button>
-                  );
-                })}
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", marginBottom: 18 }}>
+                <span style={caption({ marginRight: 2 })}>Cel</span>
+                {TARGETS.map(t => (
+                  <button key={t} onClick={() => setDayGoal(t)} className="press" style={pillBtn(targetFor(selected) === t)}>{t}</button>
+                ))}
                 {goals.days[selected] && goals.days[selected] !== goals.global && (
-                  <button onClick={makeGlobalGoal} title="Użyj tego celu dla wszystkich dni bez własnego celu"
-                    style={{ border: "none", background: "none", color: RED, fontSize: 10.5, fontWeight: 700, cursor: "pointer", textDecoration: "underline", padding: 0, textTransform: "uppercase", letterSpacing: 0.5 }}>
-                    domyślny
-                  </button>
+                  <button onClick={makeGlobalGoal} title="Użyj tego celu dla wszystkich dni bez własnego celu" className="press"
+                    style={{ ...linkBtn, color: GREEN_DEEP }}>Ustaw domyślny</button>
                 )}
               </div>
 
@@ -806,86 +827,108 @@ export default function App({ session }) {
                     const goal = targetFor(selected);
                     const diff = totals.kcal - goal;
                     const onTrack = Math.abs(diff) <= 50;
-                    const barColor = onTrack ? "#0F8B5F" : diff > 0 ? RED : "#F0A202";
+                    const tone = onTrack ? { bar: GREEN, bg: GREEN_SOFT, fg: GREEN_DEEP }
+                      : diff > 0 ? { bar: RED, bg: RED_SOFT, fg: RED_DEEP }
+                      : { bar: AMBER, bg: AMBER_SOFT, fg: AMBER_DEEP };
                     const eDay = eaten[selected] || {};
                     let eKcal = 0, eN = 0;
                     CATS.forEach(cat => { const r = byId[sel[cat]]; if (r && eDay[cat]) { eKcal += r.kcal; eN++; } });
                     return (
-                      <div style={{ marginBottom: 16, border: RULE, background: CREAM, padding: "10px 11px" }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, fontFamily: MONO, fontSize: 13 }}>
-                          <b style={{ fontSize: 15 }}>{totals.kcal} / {goal} kcal</b>
-                          <b style={{ color: barColor, fontSize: 14 }}>{diff >= 0 ? "+" : "−"}{Math.abs(diff)}</b>
+                      <div style={{ marginBottom: 20 }}>
+                        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 10 }}>
+                          <div style={{ display: "flex", alignItems: "baseline", gap: 7 }}>
+                            <span style={{ fontSize: 30, fontWeight: 700, letterSpacing: -1, ...NUM }}>{totals.kcal}</span>
+                            <span style={{ fontSize: 14, color: MUTED, fontWeight: 500, ...NUM }}>/ {goal} kcal</span>
+                          </div>
+                          <span style={{ background: tone.bg, color: tone.fg, borderRadius: R_PILL, padding: "4px 11px", fontSize: 13, fontWeight: 600, ...NUM }}>
+                            {diff >= 0 ? "+" : "−"}{Math.abs(diff)}
+                          </span>
                         </div>
-                        <div style={{ height: 12, background: PAPER, border: RULE_THIN, margin: "8px 0 7px", overflow: "hidden" }}>
-                          <div style={{ width: `${Math.min(100, totals.kcal / goal * 100)}%`, height: "100%", background: barColor }} />
+                        <div style={{ height: 8, background: FILL, borderRadius: R_PILL, margin: "12px 0 9px", overflow: "hidden" }}>
+                          <div style={{ width: `${Math.min(100, totals.kcal / goal * 100)}%`, height: "100%", background: tone.bar,
+                            borderRadius: R_PILL, transition: "width .35s cubic-bezier(.2,.8,.3,1)" }} />
                         </div>
-                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10.5, fontFamily: MONO, color: MUTED }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12.5, color: MUTED, ...NUM }}>
                           <span>B {totals.p} · T {totals.f} · W {totals.c}</span>
-                          <span style={{ color: eN ? INK : MUTED, fontWeight: eN ? 700 : 400 }}>zjedzone {eN}/{totals.n} · {eKcal} kcal</span>
+                          <span style={{ color: eN ? GREEN_DEEP : MUTED, fontWeight: eN ? 600 : 500 }}>Zjedzone {eN}/{totals.n} · {eKcal} kcal</span>
                         </div>
                       </div>
                     );
                   })()
-                : <div style={{ fontSize: 12.5, color: MUTED, marginBottom: 16, border: `2px dashed ${INK}55`, padding: "12px 11px", fontFamily: SANS }}>Brak zaplanowanych posiłków — wybierz je poniżej lub wylosuj pod cel dnia.</div>}
+                : <div style={{ background: FILL, borderRadius: R_CTRL, padding: "16px 14px", marginBottom: 20, fontSize: 13.5, color: MUTED, lineHeight: 1.55 }}>
+                    Brak zaplanowanych posiłków — wybierz je poniżej albo wylosuj cały dzień pod cel.
+                  </div>}
 
-              {CATS.map(cat => {
-                const r = byId[sel[cat]];
-                const isEaten = !!(eaten[selected] || {})[cat];
-                return (
-                  <div key={cat} style={{ marginBottom: 12 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5, gap: 8 }}>
-                      <span style={{ background: CAT_COLORS[cat], border: RULE_THIN, padding: "2px 8px", ...label({ color: "#fff", fontSize: 10 }) }}>{cat}</span>
-                      {r && (
-                        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                          <button onClick={() => setModal(r)} style={{ border: "none", background: "none", color: INK, fontSize: 10.5, fontWeight: 700, cursor: "pointer", textDecoration: "underline", padding: 0, textTransform: "uppercase", letterSpacing: 0.5 }}>przepis</button>
-                          <button onClick={() => toggleEaten(selected, cat)} title={isEaten ? "Cofnij oznaczenie" : "Oznacz jako zjedzone"} style={{
-                            border: RULE_THIN, background: isEaten ? INK : PAPER, color: isEaten ? CREAM : MUTED,
-                            padding: "2px 8px", fontSize: 10, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap",
-                            textTransform: "uppercase", letterSpacing: 0.5
-                          }}>{isEaten ? "✓ zjedzone" : "zjedzone?"}</button>
-                        </span>
-                      )}
+              <div style={listBox}>
+                {CATS.map((cat, i) => {
+                  const r = byId[sel[cat]];
+                  const isEaten = !!(eaten[selected] || {})[cat];
+                  return (
+                    <div key={cat} style={{ borderTop: i ? `1px solid ${LINE}` : "none", background: isEaten ? GREEN_SOFT : CARD }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "10px 12px 0" }}>
+                        <span style={{ background: CAT_TINT[cat].bg, color: CAT_TINT[cat].fg, borderRadius: R_PILL, padding: "3px 10px", fontSize: 11.5, fontWeight: 700 }}>{cat}</span>
+                        {r && (
+                          <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            <button onClick={() => setModal(r)} className="press" style={linkBtn}>Przepis</button>
+                            <button onClick={() => toggleEaten(selected, cat)} title={isEaten ? "Cofnij oznaczenie" : "Oznacz jako zjedzone"} className="press"
+                              style={{ display: "inline-flex", alignItems: "center", gap: 5, border: `1px solid ${isEaten ? GREEN : LINE}`,
+                                background: isEaten ? GREEN : CARD, color: isEaten ? "#fff" : MUTED, borderRadius: R_PILL,
+                                padding: "4px 11px", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
+                              {isEaten && <Icon d={P_CHECK} size={12} stroke={2.8} />}
+                              {isEaten ? "Zjedzone" : "Zjedzone?"}
+                            </button>
+                          </span>
+                        )}
+                      </div>
+                      <button onClick={() => setPicker(cat)} className="press row" style={{
+                        width: "100%", display: "flex", alignItems: "center", gap: 12, textAlign: "left",
+                        border: "none", background: "transparent", cursor: "pointer",
+                        padding: r ? "10px 12px 12px" : "12px 12px 16px"
+                      }}>
+                        {r ? (
+                          <>
+                            <RecipeThumb key={r.id} r={r} size={50} />
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div className="clamp2" style={{ fontSize: 14.5, fontWeight: 600, color: INK, lineHeight: 1.3 }}>{r.name}</div>
+                              <div style={{ marginTop: 6 }}><MacroChips r={r} size="sm" /></div>
+                            </div>
+                            <Icon d={P_CHEVRON} size={18} color={MUTED} />
+                          </>
+                        ) : (
+                          <span style={{ display: "inline-flex", alignItems: "center", gap: 8, color: GREEN_DEEP, fontSize: 14, fontWeight: 600 }}>
+                            <Icon d={P_PLUS} size={16} color={GREEN_DEEP} stroke={2.2} /> Wybierz posiłek
+                          </span>
+                        )}
+                      </button>
                     </div>
-                    <button onClick={() => setPicker(cat)} className="b" style={{
-                      width: "100%", display: "flex", alignItems: "center", gap: 11, textAlign: "left",
-                      padding: r ? "8px 9px" : "16px 12px", cursor: "pointer",
-                      border: RULE, boxShadow: isEaten ? "none" : HARD_SM,
-                      background: isEaten ? CREAM : PAPER, opacity: isEaten ? 0.7 : 1
-                    }}>
-                      {r ? (
-                        <>
-                          <RecipeThumb key={r.id} r={r} size={46} />
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ fontSize: 13.5, fontWeight: 700, color: INK, lineHeight: 1.25, fontFamily: SANS }}>{r.name}</div>
-                            <div style={{ marginTop: 5 }}><MacroChips r={r} size="sm" /></div>
-                          </div>
-                          <span style={{ color: INK, fontSize: 17, flexShrink: 0, fontWeight: 700 }}>→</span>
-                        </>
-                      ) : (
-                        <span style={{ color: MUTED, fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8 }}>+ Wybierz posiłek</span>
-                      )}
-                    </button>
-                  </div>
-                );
-              })}
-
-              <div style={{ marginTop: 18, borderTop: RULE_THICK, paddingTop: 14 }}>
-                <button onClick={fillDay} className="b" style={{ background: RED, color: "#fff", border: RULE, boxShadow: HARD_SM, padding: "12px 18px", fontWeight: 700, fontSize: 12.5, cursor: "pointer", textTransform: "uppercase", letterSpacing: 0.8, width: "100%" }}>
-                  Wylosuj dzień pod {targetFor(selected)} kcal
-                </button>
-                <div style={{ fontSize: 10.5, color: MUTED, marginTop: 8, fontFamily: MONO, lineHeight: 1.5 }}>Losuje 4 posiłki tak, aby suma trafiła w cel (±50 kcal). Kliknij ponownie, jeśli zestaw nie pasuje.</div>
+                  );
+                })}
               </div>
+
+              <button onClick={fillDay} className="press" style={{
+                marginTop: 18, width: "100%", background: GREEN, color: "#fff", border: "none", borderRadius: R_CTRL,
+                padding: "14px 18px", fontSize: 15, fontWeight: 600, cursor: "pointer", boxShadow: GREEN_GLOW
+              }}>Wylosuj dzień pod {targetFor(selected)} kcal</button>
+              <p style={{ fontSize: 12.5, color: MUTED, margin: "10px 2px 0", lineHeight: 1.55 }}>
+                Losuje 4 posiłki tak, aby suma trafiła w cel (±50 kcal). Kliknij ponownie, jeśli zestaw nie pasuje.
+              </p>
             </section>
 
             {/* CALENDAR */}
-            <section style={card}>
+            <section style={cardStyle}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
-                <button onClick={() => setView(v => ({ y: v.m === 0 ? v.y-1 : v.y, m: (v.m+11)%12 }))} style={{ border: RULE, background: PAPER, width: 32, height: 32, cursor: "pointer", fontSize: 15, fontWeight: 700 }}>←</button>
-                <div style={{ fontFamily: SANS, fontSize: 17, fontWeight: 800, textTransform: "uppercase", letterSpacing: -0.3 }}>{MONTHS[view.m]} {view.y}</div>
-                <button onClick={() => setView(v => ({ y: v.m === 11 ? v.y+1 : v.y, m: (v.m+1)%12 }))} style={{ border: RULE, background: PAPER, width: 32, height: 32, cursor: "pointer", fontSize: 15, fontWeight: 700 }}>→</button>
+                <button onClick={() => setView(v => ({ y: v.m === 0 ? v.y - 1 : v.y, m: (v.m + 11) % 12 }))}
+                  className="press" aria-label="Poprzedni miesiąc" style={iconBtn}>
+                  <Icon d={P_BACK} size={17} color={INK_SOFT} />
+                </button>
+                <div style={{ fontSize: 16.5, fontWeight: 600, letterSpacing: -0.3 }}>{MONTHS[view.m]} {view.y}</div>
+                <button onClick={() => setView(v => ({ y: v.m === 11 ? v.y + 1 : v.y, m: (v.m + 1) % 12 }))}
+                  className="press" aria-label="Następny miesiąc" style={iconBtn}>
+                  <Icon d={P_CHEVRON} size={17} color={INK_SOFT} />
+                </button>
               </div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 3 }}>
-                {DOW.map(d => <div key={d} style={{ textAlign: "center", fontSize: 10, fontWeight: 700, color: MUTED, padding: "3px 0", textTransform: "uppercase", letterSpacing: 0.5, fontFamily: MONO }}>{d}</div>)}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 4 }}>
+                {DOW.map(d => <div key={d} style={{ textAlign: "center", fontSize: 11.5, fontWeight: 600, color: MUTED, padding: "0 0 6px" }}>{d}</div>)}
                 {weeks.flat().map((dt, i) => {
                   const k = keyOf(dt);
                   const inMonth = dt.getMonth() === view.m;
@@ -894,26 +937,28 @@ export default function App({ session }) {
                   const t = dayTotals(k);
                   const day = plan[k] || {};
                   return (
-                    <button key={i} onClick={() => setSelected(k)} style={{
-                      border: isSel ? `2px solid ${INK}` : isToday ? `2px solid ${RED}` : `1.5px solid ${INK}33`,
-                      background: isSel ? INK : inMonth ? PAPER : "transparent",
-                      color: isSel ? CREAM : INK,
-                      opacity: inMonth ? 1 : 0.4, padding: "5px 3px 4px",
-                      minHeight: 54, cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 3
+                    <button key={i} onClick={() => setSelected(k)} className="press" style={{
+                      border: isSel ? "1.5px solid transparent" : isToday ? `1.5px solid ${GREEN}` : "1.5px solid transparent",
+                      background: isSel ? GREEN : t ? FILL : "transparent",
+                      color: isSel ? "#fff" : isToday ? GREEN_DEEP : INK,
+                      opacity: inMonth ? 1 : 0.4, borderRadius: 14, padding: "7px 2px 6px", minHeight: 58,
+                      cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4
                     }}>
-                      <span style={{ fontSize: 12.5, fontWeight: isToday || isSel ? 700 : 500, fontFamily: MONO }}>{dt.getDate()}</span>
-                      <span style={{ display: "flex", gap: 2 }}>
-                        {CATS.map(c => byId[day[c]] ? <span key={c} style={{ width: 5, height: 5, background: CAT_COLORS[c] }} /> : null)}
+                      <span style={{ fontSize: 14, fontWeight: isSel || isToday ? 700 : 500, ...NUM }}>{dt.getDate()}</span>
+                      <span style={{ display: "flex", gap: 3, height: 5 }}>
+                        {CATS.map(c => byId[day[c]]
+                          ? <span key={c} style={{ width: 5, height: 5, borderRadius: R_PILL, background: isSel ? "rgba(255,255,255,.92)" : CAT_COLORS[c] }} />
+                          : null)}
                       </span>
-                      {t && <span style={{ fontSize: 9, color: isSel ? CREAM : MUTED, fontWeight: 700, fontFamily: MONO }}>{t.kcal}</span>}
+                      <span style={{ fontSize: 10, fontWeight: 600, height: 13, color: isSel ? "rgba(255,255,255,.9)" : MUTED, ...NUM }}>{t ? t.kcal : ""}</span>
                     </button>
                   );
                 })}
               </div>
-              <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap", borderTop: RULE, paddingTop: 10 }}>
+              <div style={{ display: "flex", gap: 14, marginTop: 16, flexWrap: "wrap", borderTop: `1px solid ${LINE}`, paddingTop: 14 }}>
                 {CATS.map(c => (
-                  <span key={c} style={{ fontSize: 10, color: INK, display: "flex", alignItems: "center", gap: 5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5 }}>
-                    <span style={{ width: 9, height: 9, background: CAT_COLORS[c], border: `1px solid ${INK}` }} />{c}
+                  <span key={c} style={{ fontSize: 12.5, color: INK_SOFT, display: "flex", alignItems: "center", gap: 6, fontWeight: 500 }}>
+                    <span style={{ width: 8, height: 8, borderRadius: R_PILL, background: CAT_COLORS[c] }} />{c}
                   </span>
                 ))}
               </div>
@@ -922,42 +967,47 @@ export default function App({ session }) {
         )}
 
         {tab === "shop" && loaded && (
-          <section style={{ ...card, maxWidth: 640, margin: "0 auto", padding: 18 }}>
-            <h2 style={{ fontFamily: SANS, fontSize: 23, fontWeight: 800, margin: "0 0 14px", textTransform: "uppercase", letterSpacing: -0.6 }}>Lista zakupów</h2>
-            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "end", marginBottom: 16 }}>
-              <div style={{ flex: 1, minWidth: 140 }}>
-                <label style={{ ...label(), color: MUTED, display: "block", marginBottom: 4 }}>Od</label>
-                <input type="date" value={from} onChange={e => setFrom(e.target.value)} style={selectStyle} />
+          <section style={{ ...cardStyle, maxWidth: 660, margin: "0 auto" }}>
+            <h2 style={{ fontSize: 22, fontWeight: 700, margin: "0 0 16px", letterSpacing: -0.5 }}>Lista zakupów</h2>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 18 }}>
+              <div style={{ flex: 1, minWidth: 150 }}>
+                <label style={{ ...caption(), display: "block", marginBottom: 6 }}>Od</label>
+                <input type="date" value={from} onChange={e => setFrom(e.target.value)} style={dateInput} />
               </div>
-              <div style={{ flex: 1, minWidth: 140 }}>
-                <label style={{ ...label(), color: MUTED, display: "block", marginBottom: 4 }}>Do</label>
-                <input type="date" value={to} onChange={e => setTo(e.target.value)} style={selectStyle} />
+              <div style={{ flex: 1, minWidth: 150 }}>
+                <label style={{ ...caption(), display: "block", marginBottom: 6 }}>Do</label>
+                <input type="date" value={to} onChange={e => setTo(e.target.value)} style={dateInput} />
               </div>
             </div>
 
             {shopping && shopping.total > 0 ? (
               <>
-                <div style={{ background: INK, color: CREAM, padding: "10px 12px", fontSize: 12, marginBottom: 16, fontFamily: MONO }}>
-                  <b>{shopping.days}</b> dni · <b>{shopping.meals}</b> posiłków · <b>{shopping.kcal}</b> kcal
-                  <div style={{ fontSize: 10, color: "#A8A092", marginTop: 3 }}>Ilości przeliczone na 1 porcję i zsumowane.</div>
+                <div style={{ background: GREEN_SOFT, borderRadius: R_CTRL, padding: "12px 14px", marginBottom: 20 }}>
+                  <div style={{ fontSize: 14.5, fontWeight: 600, color: GREEN_DEEP, ...NUM }}>
+                    {shopping.days} {plural(shopping.days, "dzień", "dni", "dni")} · {shopping.meals} {plural(shopping.meals, "posiłek", "posiłki", "posiłków")} · {shopping.kcal} kcal
+                  </div>
+                  <div style={{ fontSize: 12.5, color: INK_SOFT, marginTop: 3 }}>Ilości przeliczone na 1 porcję i zsumowane.</div>
                 </div>
                 {shopping.groups.map(group => {
                   const doneIn = group.items.filter(i => checked[i.key]).length;
                   return (
-                    <div key={group.cat} style={{ marginBottom: 18 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: CREAM, border: RULE, padding: "6px 10px" }}>
-                        <span style={{ ...label(), fontSize: 11 }}>{group.cat}</span>
-                        <span style={{ fontSize: 11, color: MUTED, fontWeight: 700, fontFamily: MONO }}>{doneIn}/{group.items.length}</span>
+                    <div key={group.cat} style={{ marginBottom: 20 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "0 4px 8px" }}>
+                        <span style={sectionLabel()}>{group.cat}</span>
+                        <span style={{ fontSize: 12.5, color: MUTED, fontWeight: 600, ...NUM }}>{doneIn}/{group.items.length}</span>
                       </div>
-                      <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-                        {group.items.map(item => {
+                      <ul style={{ ...listBox, listStyle: "none", padding: 0, margin: 0 }}>
+                        {group.items.map((item, idx) => {
                           const done = checked[item.key];
                           return (
-                            <li key={item.key}>
-                              <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 8px", borderBottom: `1px solid ${INK}22`, cursor: "pointer", opacity: done ? 0.4 : 1 }}>
-                                <input type="checkbox" checked={!!done} onChange={() => toggleChecked(item.key)} style={{ width: 17, height: 17, accentColor: RED, flexShrink: 0 }} />
-                                <span style={{ flex: 1, fontSize: 13.5, fontWeight: 500, textDecoration: done ? "line-through" : "none" }}>{item.name}</span>
-                                <span style={{ fontWeight: 700, fontSize: 12, color: INK, fontFamily: MONO }}>{fmtG(item.g)}</span>
+                            <li key={item.key} style={{ borderTop: idx ? `1px solid ${LINE}` : "none" }}>
+                              <label className="row" style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 14px",
+                                cursor: "pointer", background: done ? FILL : CARD }}>
+                                <input type="checkbox" checked={!!done} onChange={() => toggleChecked(item.key)}
+                                  style={{ width: 19, height: 19, accentColor: GREEN, flexShrink: 0, cursor: "pointer" }} />
+                                <span style={{ flex: 1, fontSize: 14.5, fontWeight: 500, color: done ? MUTED : INK,
+                                  textDecoration: done ? "line-through" : "none" }}>{item.name}</span>
+                                <span style={{ fontSize: 13, fontWeight: 600, color: done ? MUTED : INK_SOFT, ...NUM }}>{fmtG(item.g)}</span>
                               </label>
                             </li>
                           );
@@ -966,15 +1016,18 @@ export default function App({ session }) {
                     </div>
                   );
                 })}
-                <div style={{ fontSize: 11, color: MUTED, marginTop: 4, fontFamily: MONO }}>Odhaczone: {Object.values(checked).filter(Boolean).length} / {shopping.total}</div>
+                <div style={{ fontSize: 13, color: MUTED, textAlign: "center", ...NUM }}>
+                  Odhaczone: {Object.values(checked).filter(Boolean).length} / {shopping.total}
+                </div>
               </>
             ) : (
-              <div style={{ color: MUTED, fontSize: 13, padding: "24px 0", textAlign: "center", fontFamily: SANS }}>
+              <div style={{ color: MUTED, fontSize: 14, padding: "32px 0", textAlign: "center", lineHeight: 1.6 }}>
                 Brak posiłków w wybranym zakresie dat.<br />Zaplanuj dietę w zakładce Kalendarz.
               </div>
             )}
           </section>
         )}
+        {tab === "progress" && <Progress user={user} />}
       </main>
 
       {picker && (
@@ -990,7 +1043,7 @@ export default function App({ session }) {
           onPreview={r => setModal(r)}
           onClose={() => setPicker(null)} />
       )}
-      {modal && <RecipeModal recipe={modal} onClose={() => setModal(null)} />}
+      {modal && <RecipeModal key={modal.id} recipe={modal} onClose={() => setModal(null)} />}
     </div>
   );
 }

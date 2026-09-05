@@ -3,8 +3,13 @@ import { supabase, supabaseConfigured } from "./lib/supabaseClient.js";
 import Auth from "./Auth.jsx";
 import App from "./App.jsx";
 
-const INK = "#141210";
-const CARD = { minHeight: "100dvh", background: "#EFE7D8", display: "flex", alignItems: "center", justifyContent: "center", padding: 24, fontFamily: "'Bricolage Grotesque', system-ui, sans-serif" };
+const FONT = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif";
+const INK = "#1C1C1E";
+const MUTED = "#8E8E93";
+const SCREEN = {
+  minHeight: "100dvh", background: "#F4F4F7", display: "flex", alignItems: "center",
+  justifyContent: "center", padding: 24, fontFamily: FONT, color: INK, WebkitFontSmoothing: "antialiased"
+};
 
 export default function Root() {
   const [session, setSession] = useState(undefined); // undefined = still checking, null = signed out
@@ -18,10 +23,11 @@ export default function Root() {
 
   if (!supabaseConfigured) {
     return (
-      <div style={CARD}>
-        <div style={{ maxWidth: 420, background: "#FBF7EE", border: `3px solid ${INK}`, boxShadow: `5px 5px 0 ${INK}`, padding: 22, color: INK }}>
-          <h2 style={{ fontSize: 19, fontWeight: 800, margin: "0 0 10px", textTransform: "uppercase", letterSpacing: -0.4 }}>Brak konfiguracji Supabase</h2>
-          <p style={{ fontSize: 13, color: "#6E6656", lineHeight: 1.6, margin: 0 }}>
+      <div style={SCREEN}>
+        <div style={{ maxWidth: 420, background: "#fff", borderRadius: 22, padding: 26,
+          boxShadow: "0 1px 2px rgba(16,24,40,.04), 0 12px 32px rgba(16,24,40,.08)" }}>
+          <h2 style={{ fontSize: 19, fontWeight: 700, margin: "0 0 10px", letterSpacing: -0.4 }}>Brak konfiguracji Supabase</h2>
+          <p style={{ fontSize: 14, color: "#55555C", lineHeight: 1.6, margin: 0 }}>
             Utwórz plik <code>.env.local</code> na podstawie <code>.env.example</code> i uzupełnij{" "}
             <code>VITE_SUPABASE_URL</code> oraz <code>VITE_SUPABASE_ANON_KEY</code>, a następnie zrestartuj{" "}
             <code>npm run dev</code>.
@@ -32,7 +38,7 @@ export default function Root() {
   }
 
   if (session === undefined) {
-    return <div style={{ ...CARD, color: "#6E6656", fontSize: 13, fontFamily: "'JetBrains Mono', ui-monospace, monospace" }}>Wczytywanie…</div>;
+    return <div style={{ ...SCREEN, color: MUTED, fontSize: 14 }}>Wczytywanie…</div>;
   }
 
   return session ? <App session={session} /> : <Auth />;

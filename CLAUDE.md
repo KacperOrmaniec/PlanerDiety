@@ -20,11 +20,13 @@ npm run preview  # serve the dist/ build locally to sanity-check before deployin
 
 There is no lint or test setup in this repo (no ESLint config, no test runner). The closest thing to
 verification is `npm run build` succeeding and manually exercising the app in a browser. The build
-currently emits one ~682 kB JS chunk (~176 kB gzip) and warns about the 500 kB chunk limit — that
+currently emits one ~713 kB JS chunk (~188 kB gzip) and warns about the 500 kB chunk limit — that
 warning is expected, not a regression (see "Known issues").
 
 Requires a `.env.local` (gitignored, see `.env.example`) with `VITE_SUPABASE_URL` and
-`VITE_SUPABASE_ANON_KEY` for a Supabase project that has run `supabase/schema.sql`. Without them the
+`VITE_SUPABASE_ANON_KEY` for a Supabase project that has run `supabase/schema.sql` — which now
+creates the `plans` table, the `progress` table and the private `progress-photos` storage bucket,
+and is safe to re-run (every statement is guarded). Without them the
 app does not crash: `supabaseClient.js` exports `supabaseConfigured = false` (and `supabase = null`),
 and `Root.jsx` renders a Polish "Brak konfiguracji Supabase" card instead of the auth screen.
 `PEXELS_API_KEY` in the same file is used only by `scripts/fetch-recipe-photos.mjs` (Node, never
@@ -32,18 +34,45 @@ bundled).
 
 ## Architecture
 
-**Almost the entire app is one file: `src/App.jsx` (~750 lines).** It contains every component
-(calendar grid, day panel, `PickerModal`, `RecipeModal`, shopping list), the Supabase sync layer, and
-all state management — there is no router, no component library, no CSS files.
+**The app is three tabs across three files**, with no router, no component library and no CSS files:
 
-Styling is inline `style={}` objects throughout, on a hand-picked "warm brutalism" palette defined as
-constants at the top of the file: `INK`/`CREAM`/`PAPER`/`RED`/`MUTED`, plus `RULE`/`RULE_THIN`/
-`RULE_THICK` borders and `HARD`/`HARD_SM` hard (unblurred) offset shadows, square corners, no
-decorative emoji. Category colors are `CAT_COLORS`/`CAT_MARK`; shopping-list section order is
-`SHOP_CATS`. Fonts (Bricolage Grotesque + JetBrains Mono, constants `SANS`/`MONO`) are loaded from
-Google Fonts in `index.html`. The only non-inline CSS is two small `<style>` blocks in `App.jsx` and
-`Auth.jsx` (focus rings, the `.b` press animation, one mobile grid-collapse media query). When making
-UI changes, match this inline-style convention rather than introducing a CSS/styling system.
+- `src/App.jsx` (~950 lines) — the shell (header, tab switch) plus the two meal-planning tabs:
+  calendar grid, day panel, `PickerModal`, `RecipeModal`, shopping list, and the Supabase sync layer.
+- `src/Progress.jsx` (~700 lines) — the "Postępy" tab in full (see below). Split out rather than
+  bolted onto `App.jsx` purely for size; it follows the same conventions.
+- `src/ui.jsx` — the design tokens, date helpers and shared pieces both import. Anything used by
+  more than one tab belongs here.
+
+Styling is inline `style={}` objects throughout, on a calm iOS-flavoured system defined as constants
+in `src/ui.jsx`. Match it rather than introducing a CSS/styling system:
+
+- **One typeface.** `FONT` is Inter (loaded in `index.html`) over the native `-apple-system` stack, so
+  Apple devices get real SF Pro. There is no second family — numbers use `NUM`
+  (`font-variant-numeric: tabular-nums`) instead of a monospace font, which is what keeps counters and
+  kcal figures from jittering as they change.
+- **Surfaces.** `BG` (#F4F4F7) behind `CARD` (white) panels: `cardStyle` = radius `R_CARD` (20) plus
+  the soft `SHADOW`. Inset lists use `listBox` — a `LINE` hairline, radius `R_CTRL` (14), and rows
+  separated by `borderTop` hairlines rather than boxed borders. `FILL` is the inset control fill
+  (search field, segmented track, progress track). Radii: `R_CARD` / `R_CTRL` / `R_PILL` (999).
+- **The accent is light green.** `GREEN` (#34C759) fills the primary button, the selected calendar
+  day, active pills and the progress bar; `GREEN_DEEP` is the same accent where it must read as text
+  on white (`GREEN` alone fails contrast); `GREEN_SOFT` is the tinted surface behind accent content.
+  `AMBER` and `RED` come with matching `_SOFT`/`_DEEP` pairs and are used only for over/under-target
+  states and warnings.
+- **Category colours avoid green on purpose** (`CAT_COLORS`: amber / teal / indigo / pink), so a
+  coloured dot on a calendar cell never reads as "on target". `CAT_TINT` carries the soft
+  background + readable foreground pair used for category pills; `MACROS` does the same for B/T/W.
+- **Shared pieces**: `caption()` and `sectionLabel()` for the two label sizes, `pillBtn(active)` for
+  chips, `iconBtn` for round icon buttons, `overlay(z)` + `sheet` for modals, and `Icon` with the
+  `P_*` path constants — one stroked SVG set, so nothing depends on an icon font or a decorative
+  emoji. Interactive surfaces take `className="press"` (scale on tap) and list rows `className="row"`
+  (hover tint); `clamp2` / `ellip` keep list rows a steady height.
+- The only non-inline CSS is one `<style>` block each in `App.jsx` and `Auth.jsx` (focus rings, the
+  press/hover transitions, the truncation helpers, and the single `.split` media query that collapses
+  the calendar's two columns under 880px).
+
+Polish text goes through `plural(n, one, few, many)` for anything counted, and dates through
+`fmtPL` (genitive month: "5 września", not "5 wrzesień") plus `dowOf` for the weekday line.
 
 `src/main.jsx` mounts `<Root />` (not `<App />` directly) and registers the service worker
 (production only). `src/Root.jsx` is the auth gate: it checks `supabase.auth.getSession()` and
@@ -177,6 +206,60 @@ enforced server-side regardless of what the client sends. The plan syncs across 
 the user is signed into the same account — but only at load time: there is no realtime subscription
 and no merge, so two devices editing the same column overwrite each other last-write-wins.
 
+### Progress tracking (`src/Progress.jsx`)
+
+The third tab, "Postępy": body measurements, photos and before/after comparison. It is the one part
+of the app with its own table and its own file storage, and the only one that does normal per-row
+CRUD rather than the whole-column overwrites the meal plan uses.
+
+**A `ProgressEntry` is one check-in on a user-chosen date** (`public.progress`, one row per
+`(user_id, date)` — the unique constraint is what makes "add for today" and "edit today" the same
+action). Every measurement column is nullable **on purpose**: somebody may weigh themselves in the
+morning and photograph in the evening, or track only weight for a few weeks. Nothing in the UI
+requires a complete entry; the only guard is that a check-in must carry *something* (a measurement,
+a photo or a note). Columns: `weight` (kg), `waist` / `hips` / `thigh` / `biceps` (cm),
+`body_fat_percent`, `muscle_percent`, `photo_front` / `photo_side` / `photo_back` (storage paths),
+`note`.
+
+`METRICS` is the single source of truth for the seven tracked values — label, unit, chart colour,
+sanity ceiling for validation, and `better: "up" | "down"`, which decides whether a delta is painted
+green or red. Biceps and muscle percentage count as gains; everything else counts as losses.
+
+**Views** (a `Segmented` switch, all inside the one tab):
+- *Przegląd* — the latest check-in as a card (big weight plus the delta against the previous entry
+  that has one), a weight sparkline, and the history list with a photo thumbnail per row. A floating
+  green "+" opens the editor.
+- *Wykresy* — metric picker × time range (1/3/6 mies., rok, całość) over the `Chart` component.
+- *Metamorfoza* — two date pickers (oldest → newest by default), photo pairs per slot, a delta table,
+  and "Udostępnij" which composes **one shareable image** on a canvas (title, date range with day
+  count, before/after photos, delta table) and hands it to `navigator.share`, falling back to a
+  download. The fallback matters: composing is async, so the tap that started it may no longer count
+  as a user gesture by the time the share sheet is requested — any failure other than the user
+  cancelling degrades to a download rather than an error.
+
+**Charts have no library.** `Chart` is an inline SVG line with an area wash, a dot per real
+measurement and a drag-to-read tooltip, sized from a `ResizeObserver`. Crucially it only plots
+entries that actually carry the selected metric, so a partial check-in leaves a **gap** rather than a
+zero — a weight-only entry adds a point to the weight chart and none to the others.
+
+**Photos never go in the database.** They are resized client-side (1400 px full, 320 px thumbnail,
+JPEG) and uploaded to the **private** `progress-photos` bucket at
+`<user_id>/<entry_id>/<slot>.jpg`, with the thumbnail alongside as `<slot>_thumb.jpg`; only the path
+is stored in the row. The first path segment being the owner is what the storage RLS policies match
+against `auth.uid()`. Being private, every image needs a short-lived signed URL —
+`createSignedUrls` is batched once per load and cached in state, and a save invalidates the URLs for
+any replaced photo. Uploads happen on save, not on selection, so cancelling an edit never leaves
+orphan files; deleting an entry removes its files too.
+
+Numbers are entered Polish-style: `parseNum` accepts a comma or a dot, `fmtNum` always renders a
+comma.
+
+**This tab does not share the plan's offline queue.** Progress rows are discrete inserts/updates, so
+a failure surfaces as an error in the editor with the form still filled, rather than being queued —
+deliberately simpler than the `plans` sync layer, and nothing is lost because the user's input stays
+on screen. If `public.progress` is missing entirely, the tab says so and points at
+`supabase/schema.sql`.
+
 ### PWA
 
 `public/manifest.webmanifest` + `public/sw.js` make the deployed site installable on Android (native
@@ -237,7 +320,7 @@ tolerance widens from 50 kcal only when nothing fits, so out-of-range goals stil
 Drawing across all five diets is deliberate — see the comment above `POOLS`.
 
 **Performance**
-- Single ~682 kB bundle: `recipes.js` + `instructions.js` (~330 kB) load eagerly even though `STEPS`
+- Single ~713 kB bundle: `recipes.js` + `instructions.js` (~330 kB) load eagerly even though `STEPS`
   is only needed inside `RecipeModal`.
 - `public/recipes/` is ~23 MB of unresized Pexels JPEGs (largest 942 kB) served into 46–58 px
   thumbnails and a 200 px hero. Combined with the SW's network-first policy, these immutable images
