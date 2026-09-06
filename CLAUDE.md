@@ -20,14 +20,14 @@ npm run preview  # serve the dist/ build locally to sanity-check before deployin
 
 There is no lint or test setup in this repo (no ESLint config, no test runner). The closest thing to
 verification is `npm run build` succeeding and manually exercising the app in a browser. The build
-currently emits one ~724 kB JS chunk (~191 kB gzip) and warns about the 500 kB chunk limit — that
+currently emits one ~730 kB JS chunk (~193 kB gzip) and warns about the 500 kB chunk limit — that
 warning is expected, not a regression (see "Known issues").
 
 Requires a `.env.local` (gitignored, see `.env.example`) with `VITE_SUPABASE_URL` and
 `VITE_SUPABASE_ANON_KEY` for a Supabase project that has run `supabase/schema.sql` — which now
-creates the `plans` table (including its `extras` column), the `progress` table and the private
-`progress-photos` storage bucket,
-and is safe to re-run (every statement is guarded). Without them the
+creates the `plans` table (including its `extras` and `favorites` columns), the `progress` table and
+the private `progress-photos` storage bucket, and is safe to re-run (every statement is guarded).
+Re-run it after pulling a change that adds a column. Without them the
 app does not crash: `supabaseClient.js` exports `supabaseConfigured = false` (and `supabase = null`),
 and `Root.jsx` renders a Polish "Brak konfiguracji Supabase" card instead of the auth screen.
 `PEXELS_API_KEY` in the same file is used only by `scripts/fetch-recipe-photos.mjs` (Node, never
@@ -45,8 +45,13 @@ bundled).
 - `src/ui.jsx` — the design tokens, date helpers and the pieces both tabs import: `Segmented`,
   `SwipeRow`, `UndoToast`, `Icon` with its `P_*` paths, and the number/plural formatters. Anything
   used by more than one tab belongs here.
+- `src/Settings.jsx` — the "Dostosuj dietę" sheet: switching individual recipes off (see "Hiding
+  recipes" below). Split out for size like `Progress.jsx`, same conventions.
 - `src/slots.js` — `CATS` (the four meal slots) and the rules deciding which recipe may be served in
   which of them (see "Allowed meal slots" below).
+- `src/diets.js` — `DIET_GROUPS` / `GROUP_OF`, derived from `RECIPES` at module load. Lifted out of
+  `App.jsx` so `Settings.jsx` can label a recipe's plan without importing from `App`, which imports
+  `Settings` back.
 
 Styling is inline `style={}` objects throughout, on a calm iOS-flavoured system defined as constants
 in `src/ui.jsx`. Match it rather than introducing a CSS/styling system:
@@ -95,8 +100,12 @@ Together they are ~340 kB of source that ships eagerly in the main bundle:
   `{ id, diet, day, cat, name, kcal, p, f, c, port, time, ing: [{ n, d, g }], note, img }`
   (`diet`/`day` place a recipe within one of 5 named meal plans "Dieta 1"–"Dieta 5" — the UI never
   shows those names, see "Meal plans by calorie level" below; `cat` is one of
-  `Śniadanie`/`Obiad`/`Kolacja`/`Przekąska`, 70 recipes each; `port` ∈ {1,2,4,5}; `ing[].g` is grams
-  used for shopping-list math; `img` is an optional explicit photo URL — currently no recipe sets it).
+  `Śniadanie`/`Obiad`/`Kolacja`/`Przekąska`, 70 recipes each; `port` ∈ {1,2,4,5} — 269 of the 280
+  are `port: 1`; `ing[].g` is grams and all shopping-list math runs on it, while `ing[].d` is the
+  same amount as the recipe writes it, either a bare `"60 g"` or a household measure with the grams
+  in brackets, `"4 sztuki (224 g)"` — every one of the 2229 ingredient rows takes one of those two
+  shapes and the bracketed figure always equals `ing[].g`, which is what makes `d` safe to parse
+  (see `houseMeasure`); `img` is an optional explicit photo URL — currently no recipe sets it).
 - `categories.js` — exports `ING_CAT`, a map of normalized ingredient name → shopping category
   (`Warzywa`, `Nabiał i jajka`, etc.), used to group the shopping list. It has 305 entries covering
   every `aggKey(...)` value `RECIPES` produces except `"woda"`, which falls through to `Inne` (as do
@@ -206,14 +215,18 @@ image — each recipe id always has its own downloaded `.jpg`.
 ### State and persistence
 
 Per-user state lives in a single Supabase table, `public.plans` (schema + RLS policies in
-`supabase/schema.sql`), one row per `user_id` with three JSONB columns mirroring what used to be
-separate `localStorage` keys:
+`supabase/schema.sql`), one row per `user_id` with six JSONB columns, the first four mirroring
+what used to be separate `localStorage` keys:
 
 - `plan` — the meal plan: `{ [dateKey]: { [category]: recipeId } }`
-- `eaten` — which planned meals are checked off as eaten: `{ [dateKey]: { [category]: true } }`
+- `eaten` — the status of each planned meal: `{ [dateKey]: { [category]: true | "skip" } }`, where
+  `true` is "zjedzone", `"skip"` is "pominiete" (see "Skipping a meal") and absent is neither
 - `goals` — calorie goals (`{ global, days: { [dateKey]: target } }`)
 - `extras` — ad-hoc food logged straight into a day (see "Quick entries" below):
   `{ [dateKey]: [ { id, name, kcal, p, f, c, cat } ] }`
+- `favorites` — the user's saved quick entries, newest first, as an array rather than a map:
+  `[ { id, name, kcal, p, f, c, cat } ]`
+- `hidden` — ids of recipes the user switched off (see "Hiding recipes"): `[ 12, 47, 203 ]`
 
 `dateKey` is zero-padded `YYYY-MM-DD` (see `keyOf`, `App.jsx:33`) — the same format
 `<input type="date">` uses, which is why the shopping-list range inputs can bind to it directly and
@@ -238,12 +251,19 @@ write layer worth understanding before touching it:
   means we don't know what the server holds, so the app renders an error card instead of the planner
   rather than let this session's empty defaults be pushed over a real stored plan; it retries every
   15 s and on `"online"` until a load succeeds.
-- `baseline` (a ref holding what the last successful load returned) lets the three sync effects tell
+- `baseline` (a ref holding what the last successful load returned) lets the four sync effects tell
   a real edit from the state change the load itself caused — without it every app open pushed all
-  three columns straight back up. The header shows a "Zapisywanie…" / "Offline — zapiszę później"
+  four columns straight back up. The header shows a "Zapisywanie…" / "Offline — zapiszę później"
   chip whenever `pending-sync-<userId>` is non-empty.
 - On load, anything left in `pending-sync-<userId>` wins over what the server returned (it was made
   on top of a fully loaded plan and never stored), and `flushPending` sends it once the load succeeds.
+- `favorites` and `hidden` both arrived after the other four, so `loadPlan` selects `PLAN_COLS`
+  optimistically and, on a `42703` (undefined column), retries with `PLAN_COLS_LEGACY` and sets
+  `schemaReady = false`. A project running an out-of-date `schema.sql` therefore keeps a working
+  planner instead of sitting behind the load-error card over features it has never used: only those
+  two go missing, both screens say why, and their sync effects are skipped so a doomed write never
+  parks the header on "Offline — zapiszę później". One flag covers both because they ship in the
+  same migration — either the SQL has been applied and both work, or it hasn't and neither does.
 
 Row Level Security means a user can only ever read/write the row matching their own `auth.uid()`,
 enforced server-side regardless of what the client sends. The plan syncs across devices as long as
@@ -345,7 +365,64 @@ Consequences worth knowing before touching this:
 - Entries are editable and deletable from the "Dodatkowo" list; a "ręczny" tag marks them apart from
   planned meals, which otherwise use the same row styling.
 
-Shopping lists ignore `extras` entirely — ad-hoc food has no ingredient breakdown to buy.
+**Saved quick entries ("Zapisane").** The same sheet keeps a per-user shortlist of things worth
+logging again — a banana, an apple, the usual coffee — in the `favorites` column. Three decisions
+carry it:
+
+- **A saved item is a template, not a logged meal.** It has the same fields as an `extras` entry and
+  no date, and tapping one only *fills the form*; the entry that lands in the day mints its own id.
+  So deleting the logged meal never touches the list, logging half a banana never rewrites "Banan",
+  and — as with everything here — nothing reaches `RECIPES`. Filling rather than logging outright is
+  also why there is no one-tap add: the amount is the thing a user most often wants to adjust first.
+- **Saving is explicit and upserts by name.** The "Zapisz na liście" toggle is off by default, and
+  checking it stores the entry under its name (`favKey` = trimmed + lowercased): a second save of
+  the same name refreshes the numbers on the item already there, keeping its id and its place,
+  rather than growing a list of duplicate bananas. A genuinely new one goes to the top, and
+  `FAV_MAX` (60) caps the list. The toggle's caption says which of the two is about to happen.
+- **Deleting reuses the day panel's path** — `SwipeRow` → 200 ms collapse → `UndoToast`, through the
+  same `removeRow` in `App`, keyed `fav:<id>`. The toast is `z-index: 60` against the sheet's
+  `overlay(45)`, so undo stays reachable with the modal open.
+
+The list renders only when adding (`isNew`) — a template picker stacked on an entry you are editing
+is noise — and is capped at 224 px with its own scroll so the form below it stays in reach.
+
+Shopping lists ignore `extras` entirely — ad-hoc food has no ingredient breakdown to buy, and saved
+entries are no different.
+
+### The shopping list and its breakdown
+
+A date range in, one line per product out: `shopping` walks every planned day in the range, skips
+meals marked `"skip"`, and sums each ingredient's grams **per portion** (`ing[].g / r.port`) under
+its `aggKey(...)`. `ING_CAT` then buckets the lines into the `SHOP_CATS` order.
+
+Each line also keeps the meals it was summed from, in `sources`, so a row can be expanded back into
+its parts - a product bought for four different dinners shows which four. Points worth keeping:
+
+- **The breakdown is built during the same walk, never recomputed on expand.** That walk already
+  visits exactly the right meals; doing it a second time on demand is how the header and its
+  breakdown start to disagree.
+- **The header is computed *from* the sources, not alongside them.** Each source's grams are rounded
+  to 0.1 g as they are stored and `it.g` is the rounded sum of exactly those numbers, so "the parts
+  add up to the total" holds by construction rather than by luck. Verified over a 30-day plan: 136
+  lines, 903 sources, zero disagreement.
+- **One meal is one source.** 36 recipes list the same product on several lines - usually a spice
+  split per component, `"Sól"` / `"Sól (do masła)"` / `"Sól (do ziemniaków)"`, which `aggKey` folds
+  together by stripping the bracket. Those merge into a single source with the grams added and the
+  household measure dropped, since it only ever described one of the lines. Left unmerged they would
+  also hand React two rows with the same key.
+- **Sources carry the recipe's own measure** (`measure`, from `houseMeasure(i.d)`) so the breakdown
+  reads "1 szklanka" rather than only "240 g" - but **only for `port: 1` recipes**, because for a
+  dish that makes four `d` describes the whole tray, not the one portion this day contributes.
+- `date`, `cat` and `recipeId` are on every source deliberately: turning a source row into a
+  tap-through to that meal needs no model change, only a handler.
+
+In the UI each row owns its expanded flag (`openItems`, in memory only - it is a glance at "why",
+not a record of the trip like the ticks are), so rows never affect each other, and a single-source
+product expands exactly like any other. The chevron is a **sibling** of the tick `<label>`, not a
+child: nested inside it, every tap that opened a breakdown would also tick the item off. The panel
+stays mounted with `aria-hidden` when closed so its height can animate, and its `max-height` cap is
+derived from the source count - each source is exactly two ellipsised lines, so the estimate never
+clips.
 
 ### Removing a meal from a day
 
@@ -364,12 +441,93 @@ become natively. Three things about it are deliberate:
 - **Undo, not confirm.** Deleting is frequent and cheap, so a dialog in front of each one gets old;
   the row collapses (a ~200 ms transition, then the state change commits) and an `UndoToast` offers
   one tap to put it back for 6 seconds. Undo restores exactly what was removed — a planned meal
-  comes back with its `eaten` flag, an ad-hoc entry at its original index in the day's array.
+  comes back with the exact status it had (eaten or skipped), an ad-hoc entry at its original index
+  in the day's array.
 
 Deleting only ever removes the day's entry. `RECIPES` is a static catalogue the app never writes to,
 so a planned meal's recipe is untouched and remains findable in the picker; the other meals of the
 day are likewise unaffected, and `dayTotals` recomputes from state so kcal and macros update in the
 same render.
+
+### Skipping a meal ("Pominiete")
+
+A planned meal the user decides not to eat - eating out, no appetite, an off day. Deliberately not
+deletion: the dish stays in its slot so the day still shows what was planned, and one tap puts it
+back. It is the softer sibling of the swipe-to-delete above.
+
+**The status lives in `eaten`, not in a column of its own.** That column holds one value per
+`(dateKey, category)`: `true` (zjedzone), `"skip"` (pominiete), or nothing. One field rather than two
+parallel maps, for two reasons - a meal can never be marked eaten *and* skipped, which two booleans
+would happily allow, and it needed no migration, so the feature works against a `plans` table that
+has never been re-created. `markMeal(dateKey, cat, value)` is the only writer: it sets the value,
+clears it when the meal already carries that state (which is what makes both buttons toggles), takes
+`null` to clear outright, and returns the previous state untouched when nothing would change - without
+that last check `setMeal`'s status reset would mint a fresh `eaten` object, and a sync write, on
+every single pick.
+
+**A skipped meal leaves the day's numbers.** `dayTotals` still counts it in `planned` but adds none
+of its kcal or macros, so the figure judged against the goal describes the day that is actually going
+to happen. The consequences are all deliberate:
+
+- the "Zjedzone x/N" denominator drops - a skipped meal is no longer something left to eat;
+- the calendar cell's kcal drops with it, and that category's dot fades to 30% instead of vanishing:
+  the day was still planned there, it just no longer carries those calories. A dot stays at full
+  strength if an ad-hoc entry occupies the same category.
+- **the shopping list drops its ingredients** - the whole point of skipping in advance. `shopping`
+  passes over those meals and now takes `eaten` as a dependency.
+- the picker's remaining-budget strip leaves it out of `others`, so a replacement is measured against
+  the real remainder;
+- a day whose meals are *all* skipped still reads as a planned day at 0 kcal, not as an empty one -
+  which is why `dayTotals` returns on `planned || q.n` rather than on `n`.
+
+**The UI only ever offers the move still open to a row.** A neutral row shows a compact circle-slash
+icon button plus "Zjedzone?"; an eaten row hides the skip button; a skipped row shows a filled grey
+"Pominiete" pill and no "Zjedzone?", greys its background to `FILL`, fades the body to 50% and
+strikes through the dish name. Neither state can be reached without clearing the other first, which
+is exactly what the single field buys. `fillDay` clears every status for the day, since a fresh draw
+is a fresh day.
+
+### Hiding recipes ("Dostosuj dietę")
+
+Not every one of the 280 recipes suits every user, so any of them can be switched off. The screen
+lives behind the sliders button in the header (`Settings.jsx`, an `overlay(48)` sheet) rather than in
+a fourth tab: curating is a rare, deliberate act, and the header is also where the goal and profile
+settings will land later.
+
+**`buildCatalogue(hiddenSet)` is the single source of truth.** It returns the per-slot pools, the
+draw table, the visible count and the empty-slot list, and *everything* that offers a recipe reads
+from it — the picker's list, `drawDay`, the header count. Nothing else filters, so no screen can
+drift out of step with what the user switched off. It is a `useMemo` over `hiddenSet`, so a toggle
+refreshes every dependent view in the same render.
+
+- **`POOLS` and `SUMS` used to be module constants and no longer are.** The draw table is now built
+  per user by `buildSums(pools)` inside the catalogue, because hiding a recipe changes it. That
+  costs ~0.2 ms against the full base, which is why it simply re-runs rather than being cached.
+- **Hiding governs what is *offered*, never what is already held.** A meal sitting in the plan keeps
+  rendering in the day panel, keeps its kcal in the totals, stays on the shopping list, and is put
+  back at the top of its own picker even though it is switched off. Same principle as a narrowed
+  `slots.js` rule: this must never silently rewrite a plan somebody already shopped for.
+- **An empty slot is allowed and no longer fatal.** `SLOT_POOLS[cat].filter(...)` can return nothing,
+  which used to reach `Math.min(...[])` → `Infinity` → `RangeError: Invalid typed array length` and
+  white-screen the app. The catalogue now reports `canDraw: false` and `emptySlots`, the draw button
+  disables itself and says which categories are empty, and that slot's picker offers a way back to
+  the settings sheet. Hiding literally everything is a supported state with its own empty card.
+- **Stored as exceptions, not as a copy of the catalogue.** `hidden` holds only the ids that are off,
+  so a recipe added by a future regeneration of `recipes.js` shows up straight away instead of
+  arriving hidden. The usual caveat applies: ids are positional, so a regeneration that renumbers
+  them re-points the exceptions at different dishes.
+
+**The screen itself** groups by the recipe's own `cat` — 70 apiece, each recipe appearing exactly
+once — because that is what makes 280 rows manageable, while the `DIET_GROUPS` chips cut across it so
+"wyłącz całą Dietę 5" is a chip plus one bulk tap. Sections start collapsed and render their rows
+only when open (a search auto-expands the ones with matches), which keeps 280 rows off the first
+paint. Each section header carries a tri-state checkbox acting on **what the filter currently
+shows**, and it is a sibling of the expand button, not a child — nested, every tap meant to open a
+section would switch the whole category off.
+
+Hiding a category here is not the same as hiding a slot: `slots.js` moves 14 owsianki from `Kolacja`
+into `Śniadanie`, so switching off the whole `Kolacja` category empties the Kolacja slot *and* takes
+the Śniadanie slot from 84 to 70.
 
 ### PWA
 
@@ -399,6 +557,77 @@ what actually protects data, not key secrecy.
 
 Note `README.md` is stale: it still describes plans living in `localStorage` under `diet-plan-v1` and
 does not mention Supabase, auth, or the required env vars. Prefer this file.
+
+## Product scope and gaps
+
+Written after a feature-by-feature comparison against the apps this one sits next to: **Respo**
+(Polish, plan-first: a questionnaire produces a jadlospis, a shopping list and a dietitian chat),
+**Fitatu** (Polish, diary-first, built on the big Polish product database) and **MyFitnessPal**
+(global, diary-first). Kept here so a future session proposes work that fits this app instead of
+re-deriving the landscape.
+
+**This is a plan-first app and should stay one.** Its unit of work is a *designed day* drawn from a
+curated base, not a food diary. That is Respo's model rather than Fitatu's, and it is where the real
+advantage sits: 280 recipes with gram-level ingredients make the shopping list exact and automatic,
+and `drawDay` can hit a calorie target uniformly at random - neither is something a diary app does.
+Competing with Fitatu head-on is not winnable and not the point: its moat is a dietitian-moderated
+Polish product database (own-brand items from Biedronka/Lidl/Zabka, chain-restaurant dishes) fed by a
+barcode scanner. No version of this repo catches that.
+
+**Hard limits that come from the data, not the code.** Worth stating because they look like UI
+choices and are not:
+
+- **The base spans only 2256-2787 kcal for a four-meal day** (`SUMS[0].min` and the draw's span), and
+  `TARGETS` (2400/2500/2600/2700) quietly encodes that. Somebody who needs 1600 or 3200 kcal cannot
+  be served at all. This is the single biggest constraint on who can use the app.
+- **Four meals, always.** `CATS` is fixed; Respo asks how many meals a day you want.
+- **Only grams can be summed.** `ing[].d` does carry the household measure ("4 sztuki", "1 szklanka")
+  and the shopping breakdown shows it per source, but a *total* can only be given in grams: adding
+  "2 sztuki" to "1 szklanka" is not defined. So the aggregated line stays "224 g" even where every
+  source under it reads in eggs.
+- **Macros only.** No fibre, sugar, salt, saturated fat or micronutrients anywhere in `RECIPES`.
+- **No allergen or diet tags** (wege, bezglutenowa, laktoza) - only free-text ingredient names.
+
+**Gaps worth closing, most valuable first.** Each is judged on what it costs *here*, given the
+architecture, not in the abstract:
+
+1. **Portion scaling** - multiply a recipe's kcal/macros/ingredient grams by a factor so the same 280
+   recipes serve 1600-3200 kcal. Removes the hard limit above, makes the draw useful to everyone, and
+   the shopping list already sums grams so it follows for free. The same factor applied to `eaten`
+   also buys Respo's "zjadlem pol porcji".
+2. **A real calorie goal** - any number, plus a TDEE wizard (height/weight/age/sex/activity/goal).
+   Every competitor opens with that questionnaire. Here the weight already sits in `public.progress`,
+   so the target can be suggested and re-suggested as weight moves. Blocked on nothing.
+3. **Macro targets** - the day panel totals B/T/W but has nothing to compare them against. Targets in
+   grams or as a % of the kcal goal, shown the way the kcal bar already is. Pure UI, data exists.
+4. **Exclusions by ingredient** - "nie jem X" as ingredient substrings filtered out of the
+   catalogue. Switching *recipes* off is done (see "Hiding recipes"); doing it by ingredient is the
+   remaining half, and `ing[].n` is already there, so it is a filter rather than new data.
+5. **Shopping list, to Respo's level** - "mam w domu" (a pantry tick distinct from "bought"), manual
+   items, share/export. The list is this app's strongest feature; the per-product breakdown is done
+   (see "The shopping list and its breakdown"), these three are what is left.
+6. **Password reset** - `supabase.auth.resetPasswordForEmail` plus a recovery screen. There is
+   currently *no* way back into an account with a forgotten password. The smallest item here, and the
+   only one that is a hole rather than a gap.
+7. **Copy a day / plan a week** - "powtorz wczoraj", "wylosuj tydzien", copy a day across a range.
+   `drawDay` exists already; this is plumbing, and it is how anyone actually fills a month.
+8. **Water** - present in all three competitors, one more column beside `extras`, trivially cheap.
+9. **A weekly summary** - adherence (planned vs `eaten` vs `extras`) over a week, in the Postepy tab
+   where the charts already live. Ties the two halves of the app together and needs no new data.
+10. **Reminders** - a push at meal times or an evening "domknij dzien" nudge. Web Push works on
+    Android and on installed iOS PWAs (16.4+) and carries over to a native shell. Retention is the
+    one thing this app currently has no answer for.
+11. **AI logging from a photo** - as of 2026 both Fitatu and Respo estimate a meal's calories from a
+    photo (Fitatu adds voice), so this reads as table stakes rather than a nice-to-have. It needs a
+    server-side call - the Supabase anon key is meant to ship to the client, an Anthropic key is not -
+    so a Supabase Edge Function, never a fetch from the browser.
+12. **Barcode scanning** - only worth it against Open Food Facts (free, reasonable Polish coverage),
+    and only as a way to fill a *quick entry*, never to grow `RECIPES`. Accept up front that coverage
+    will sit far below Fitatu's.
+
+**Deliberately not worth building here**: a crowd-sourced product database, a social feed, a
+hand-rolled exercise/step tracker (an Apple Health / Health Connect integration once the app goes
+native, not a manual one), ads or a paywall, and anything that writes to `RECIPES` at runtime.
 
 ## Known issues
 

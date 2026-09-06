@@ -23,6 +23,21 @@ create table if not exists public.plans (
 -- Shape: { "<YYYY-MM-DD>": [ { id, name, kcal, p, f, c, cat } ] } - cat is optional.
 alter table public.plans add column if not exists extras jsonb not null default '{}'::jsonb;
 
+-- The user's own shortlist of quick entries worth logging again ("zapisane"): a banana, an apple,
+-- the usual coffee. A saved item is a template, not a logged meal - same fields as one `extras`
+-- entry but no date - and copying one into a day mints a fresh id, so deleting the logged meal
+-- never touches the saved item. Still never enters the recipe catalogue.
+-- Shape: [ { id, name, kcal, p, f, c, cat } ] - newest first.
+alter table public.plans add column if not exists favorites jsonb not null default '[]'::jsonb;
+
+-- Recipes the user has switched off ("dostosowanie diety"). Stored as the exceptions to the
+-- default rather than as a copy of the catalogue, so a recipe added by a future regeneration of
+-- recipes.js shows up straight away instead of arriving hidden. Hiding governs what the app
+-- *offers*: a meal already in the plan keeps rendering, the same way a narrowed slots.js rule
+-- never empties a saved plan.
+-- Shape: [ 12, 47, 203 ] - ids from RECIPES.
+alter table public.plans add column if not exists hidden jsonb not null default '[]'::jsonb;
+
 alter table public.plans enable row level security;
 
 drop policy if exists "select own plan" on public.plans;

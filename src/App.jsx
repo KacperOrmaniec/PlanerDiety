@@ -3,18 +3,20 @@ import { RECIPES } from "./data/recipes.js";
 import { STEPS } from "./data/instructions.js";
 import { ING_CAT } from "./data/categories.js";
 import { CATS, SLOT_POOLS, slotsOfId, allowedIn, primarySlot } from "./slots.js";
+import { DIET_GROUPS, GROUP_OF } from "./diets.js";
 import { supabase } from "./lib/supabaseClient.js";
 
 import {
   FONT, GREEN, GREEN_DEEP, GREEN_SOFT, GREEN_GLOW, BG, CARD, INK, INK_SOFT, MUTED, LINE, FILL,
   AMBER, AMBER_SOFT, AMBER_DEEP, RED, RED_SOFT, RED_DEEP, R_CARD, R_CTRL, R_PILL, SHADOW_SM, NUM,
-  MONTHS, DOW, keyOf, fmtPL, dowOf, plural,
+  MONTHS, DOW, keyOf, fmtPL, fmtShort, dowOf, plural,
   caption, sectionLabel, cardStyle, listBox, iconBtn, pillBtn, primaryBtn, fieldStyle, overlay, sheet, Segmented,
   SwipeRow, UndoToast,
   fmtNum, parseNum,
-  P_CHEVRON, P_BACK, P_CLOSE, P_CHECK, P_PLUS, P_SEARCH, P_EDIT, P_TRASH, Icon,
+  P_CHEVRON, P_BACK, P_CLOSE, P_CHECK, P_PLUS, P_SEARCH, P_EDIT, P_TRASH, P_BOOKMARK, P_SKIP, P_SLIDERS, Icon,
 } from "./ui.jsx";
 import Progress from "./Progress.jsx";
+import Settings from "./Settings.jsx";
 
 // CATS (the four meal slots) lives in slots.js, next to the rules saying which recipe may go where.
 // Category colours deliberately avoid green, so a coloured dot never reads as "on target".
@@ -46,6 +48,18 @@ function aggKey(name){
 const SHOP_CATS = ["Warzywa", "Owoce", "Pieczywo", "Nabiał i jajka", "Mięso i ryby", "Sypkie i makarony", "Orzechy i bakalie", "Oleje, sosy i konserwy", "Przyprawy", "Słodkie i napoje", "Inne"];
 
 function fmtG(g){ return g >= 1000 ? `${(g/1000).toFixed(g % 1000 === 0 ? 0 : 2)} kg` : `${Math.round(g*10)/10} g`; }
+
+// `ing[].d` is the ingredient as the recipe writes it, and every one of the 2229 entries in the base
+// takes one of exactly two shapes: a bare "60 g", or a household measure with the grams in brackets
+// ("4 sztuki (224 g)", "1 szklanka (240 g)"). The bracketed figure always equals `ing[].g`, so the
+// text in front of it can be shown verbatim - which is what lets the shopping breakdown read in the
+// unit the meal was actually written in instead of converting everything to grams.
+// Returns null for the bare form, where the gram figure already says everything there is to say.
+const HOUSE_MEASURE = /^\s*([\d.,]+\s+[^()]+?)\s*\(\s*[\d.,]+\s*g\s*\)\s*$/;
+function houseMeasure(d) {
+  const m = HOUSE_MEASURE.exec(d || "");
+  return m ? m[1].trim() : null;
+}
 
 function MacroChips({ r, size }) {
   const s = size === "sm";
@@ -84,53 +98,83 @@ function RecipeThumb({ r, size, radius = 12 }) {
 // would leave most targets unreachable.
 // Drawn from what each slot actually allows (see slots.js), so a draw never puts an owsianka
 // on the dinner slot just because the spreadsheet filed it there.
-const POOLS = CATS.map(cat => SLOT_POOLS[cat]);
 const TOLERANCES = [50, 100, 200, 400, Infinity];
 
-// How many kcal totals categories i..end can reach, and in how many ways: SUMS[i].counts[k] is the
-// number of combinations totalling SUMS[i].min + k kcal, with a prefix sum for O(1) window queries.
+// How many kcal totals categories i..end can reach, and in how many ways: sums[i].counts[k] is the
+// number of combinations totalling sums[i].min + k kcal, with a prefix sum for O(1) window queries.
 // Sampling each category weighted by how many days can still be completed behind it is what makes
 // a draw uniform over every fitting day. Picking blindly (500 random combos, or first-fit
-// backtracking) skews hard once a target nears the top of the reachable 2256-2787 kcal range: the
-// same near-maximum meals keep coming back because few combinations reach that high.
-const SUMS = [{ min: 0, counts: [1] }];
-for (let i = POOLS.length - 1; i >= 0; i--) {
-  const rest = SUMS[0];
-  const kcals = POOLS[i].map(r => r.kcal);
-  const min = rest.min + Math.min(...kcals);
-  const counts = new Float64Array(rest.counts.length + Math.max(...kcals) - Math.min(...kcals));
-  for (const k of kcals)
-    for (let j = 0; j < rest.counts.length; j++) counts[rest.min + j + k - min] += rest.counts[j];
-  SUMS.unshift({ min, counts });
+// backtracking) skews hard once a target nears the top of the reachable kcal range: the same
+// near-maximum meals keep coming back because few combinations reach that high.
+function buildSums(pools) {
+  const sums = [{ min: 0, counts: [1] }];
+  for (let i = pools.length - 1; i >= 0; i--) {
+    const rest = sums[0];
+    const kcals = pools[i].map(r => r.kcal);
+    const min = rest.min + Math.min(...kcals);
+    const counts = new Float64Array(rest.counts.length + Math.max(...kcals) - Math.min(...kcals));
+    for (const k of kcals)
+      for (let j = 0; j < rest.counts.length; j++) counts[rest.min + j + k - min] += rest.counts[j];
+    sums.unshift({ min, counts });
+  }
+  for (const s of sums) {
+    s.pre = new Float64Array(s.counts.length + 1);
+    for (let i = 0; i < s.counts.length; i++) s.pre[i + 1] = s.pre[i] + s.counts[i];
+  }
+  return sums;
 }
-for (const s of SUMS) {
-  s.pre = new Float64Array(s.counts.length + 1);
-  for (let i = 0; i < s.counts.length; i++) s.pre[i + 1] = s.pre[i] + s.counts[i];
+
+// THE one place recipe visibility is decided. Every surface that offers a recipe - the picker, the
+// draw, the header count - takes its pool from the catalogue built here, so no screen can drift out
+// of step with what the user switched off in Ustawienia.
+//
+// Hiding governs what the app *offers*, never what it already holds: a meal sitting in the plan
+// keeps rendering in the day panel, keeps its kcal in the totals, stays on the shopping list and
+// stays listed in its own picker. That is the same principle as a narrowed slots.js rule, and it is
+// what stops "wyłączyłem kilka dań" from silently rewriting a plan somebody already shopped for.
+//
+// Rebuilding the whole thing costs ~0.2 ms against the full base, so it simply re-runs whenever the
+// hidden set changes rather than being cached anywhere cleverer.
+function buildCatalogue(hidden) {
+  const pools = CATS.map(cat => SLOT_POOLS[cat].filter(r => !hidden.has(r.id)));
+  // A slot with nothing left cannot be drawn from, and would take Math.min(...[]) to Infinity and
+  // blow up the typed array in buildSums - so the draw is switched off until something comes back.
+  const empty = CATS.filter((_, i) => pools[i].length === 0);
+  const sums = empty.length ? null : buildSums(pools);
+  return {
+    pools,
+    bySlot: Object.fromEntries(CATS.map((cat, i) => [cat, pools[i]])),
+    visible: RECIPES.length - hidden.size,
+    canDraw: !empty.length,
+    emptySlots: empty,
+    sums,
+    // A drawn day is always four meals, so its total can never leave this span. It narrows as
+    // recipes are switched off: hiding half the base moves it from 2256-2787 to 2301-2770.
+    minDay: sums ? sums[0].min : 0,
+    maxDay: sums ? sums[0].min + sums[0].counts.length - 1 : 0,
+  };
 }
 
 // Number of ways categories i..end land within `tol` of `rem` kcal.
-function waysWithin(i, rem, tol) {
-  const s = SUMS[i];
+function waysWithin(sums, i, rem, tol) {
+  const s = sums[i];
   let lo = Math.ceil(rem - tol) - s.min, hi = Math.floor(rem + tol) - s.min;
   lo = Number.isFinite(lo) ? Math.max(0, lo) : 0;
   hi = Number.isFinite(hi) ? Math.min(s.counts.length - 1, hi) : s.counts.length - 1;
   return hi < lo ? 0 : s.pre[hi + 1] - s.pre[lo];
 }
 
-// A drawn day is always four meals, so its total can never leave this span.
-const MIN_DAY = SUMS[0].min;
-const MAX_DAY = SUMS[0].min + SUMS[0].counts.length - 1;
-
-function drawDay(goal) {
-  const tol = TOLERANCES.find(t => waysWithin(0, goal, t) > 0); // widened only if nothing fits
+function drawDay(cat, goal) {
+  const { pools, sums } = cat;
+  const tol = TOLERANCES.find(t => waysWithin(sums, 0, goal, t) > 0); // widened only if nothing fits
   const out = [];
   let rem = goal;
-  for (let i = 0; i < POOLS.length; i++) {
-    const weights = POOLS[i].map(r => waysWithin(i + 1, rem - r.kcal, tol));
+  for (let i = 0; i < pools.length; i++) {
+    const weights = pools[i].map(r => waysWithin(sums, i + 1, rem - r.kcal, tol));
     let x = Math.random() * weights.reduce((a, b) => a + b, 0), k = 0;
     while (k < weights.length - 1 && x >= weights[k]) { x -= weights[k]; k++; }
-    out.push(POOLS[i][k]);
-    rem -= POOLS[i][k].kcal;
+    out.push(pools[i][k]);
+    rem -= pools[i][k].kcal;
   }
   return out;
 }
@@ -148,54 +192,12 @@ function readShopChecked(userId) {
   } catch { return { range: "", items: NO_TICKS }; }
 }
 
-// Diets are grouped by the calorie level they actually plan for, not by their spreadsheet name:
-// each "Dieta N" is 14 designed days, and diets whose average day lands within GROUP_TOL of each
-// other (all of them, not just pairwise neighbours) are one and the same plan as far as anyone
-// choosing a meal is concerned. In the current
-// base that joins Dieta 1-4 (2397-2410 kcal/day) into "2400 kcal" and leaves Dieta 5 (2699) as
-// "2700 kcal". Derived from RECIPES so it stays right when the base is regenerated from Excel.
-const GROUP_TOL = 100;
-
-const DIET_GROUPS = (() => {
-  const dayKcal = {};                                  // `${diet}|${day}` -> kcal of that designed day
-  for (const r of RECIPES) {
-    if (!r.diet) continue;
-    const k = `${r.diet}|${r.day}`;
-    dayKcal[k] = (dayKcal[k] || 0) + r.kcal;
-  }
-  const perDiet = {};
-  for (const [k, kcal] of Object.entries(dayKcal)) {
-    const diet = k.slice(0, k.lastIndexOf("|"));
-    (perDiet[diet] = perDiet[diet] || []).push(kcal);
-  }
-  const means = Object.entries(perDiet)
-    .map(([diet, days]) => ({ diet, mean: days.reduce((a, b) => a + b, 0) / days.length }))
-    .sort((a, b) => a.mean - b.mean);
-
-  // Compared against the lightest diet already in the cluster (the list is sorted), so a group
-  // never chains: every diet in one is within GROUP_TOL of every other, not just of its neighbour.
-  const clusters = [];
-  for (const d of means) {
-    const last = clusters[clusters.length - 1];
-    if (last && d.mean - last.means[0] <= GROUP_TOL) { last.diets.push(d.diet); last.means.push(d.mean); }
-    else clusters.push({ diets: [d.diet], means: [d.mean] });
-  }
-  return clusters.map(c => {
-    const mean = c.means.reduce((a, b) => a + b, 0) / c.means.length;
-    const kcal = Math.round(mean / 100) * 100;
-    return { kcal, label: `${kcal} kcal`, diets: c.diets };
-  });
-})();
-
-// recipe's diet -> the group it belongs to, for filtering and for the "plan" line on a recipe
-const GROUP_OF = {};
-DIET_GROUPS.forEach(g => g.diets.forEach(d => { GROUP_OF[d] = g; }));
 const TARGETS = [2400, 2500, 2600, 2700];
 const DEFAULT_GOALS = { global: 2400, days: {} };
 
 // Rendered only while open (and therefore remounted on every open), so the search box and plan
 // filter always start empty instead of carrying over from the last category that was picked.
-function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
+function PickerModal({ cat, pool, currentId, ctx, onPick, onPreview, onClose, onOpenSettings }) {
   const [q, setQ] = useState("");
   const [group, setGroup] = useState(null);
   const query = q.trim().toLowerCase();
@@ -203,9 +205,12 @@ function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
   // A meal already planned in this slot is listed even when the rules no longer allow it there,
   // so a plan made before a rule changed still shows what it holds instead of looking empty.
   const match = r => (!group || GROUP_OF[r.diet] === group) && (!query || r.name.toLowerCase().includes(query));
-  const planned = currentId && !allowedIn(byId[currentId], cat) ? byId[currentId] : null;
+  // `pool` is what the catalogue leaves visible for this slot. A meal already planned here is put
+  // back on the list even when it is switched off or no longer allowed, so a plan made earlier
+  // still shows what it holds instead of looking empty.
+  const planned = currentId && !pool.some(r => r.id === currentId) ? byId[currentId] : null;
   const buckets = {};
-  (planned ? [planned, ...SLOT_POOLS[cat]] : SLOT_POOLS[cat]).filter(match).forEach(r => {
+  (planned ? [planned, ...pool] : pool).filter(match).forEach(r => {
     const b = Math.round(r.kcal / 100) * 100;
     (buckets[b] = buckets[b] || []).push(r);
   });
@@ -245,7 +250,7 @@ function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
           <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap", alignItems: "center" }}>
             <span style={caption({ marginRight: 2 })}>Plan</span>
             <button onClick={() => setGroup(null)} className="press" style={pillBtn(!group)}>Wszystkie</button>
-            {DIET_GROUPS.map(g => (
+            {DIET_GROUPS.filter(g => pool.some(r => GROUP_OF[r.diet] === g)).map(g => (
               <button key={g.label} onClick={() => setGroup(g === group ? null : g)} className="press" style={pillBtn(g === group)}>{g.label}</button>
             ))}
           </div>
@@ -257,6 +262,18 @@ function PickerModal({ cat, currentId, ctx, onPick, onPreview, onClose }) {
               width: "100%", border: `1px solid ${LINE}`, background: CARD, borderRadius: R_CTRL,
               padding: "11px 12px", fontSize: 13.5, color: RED_DEEP, fontWeight: 600, cursor: "pointer", margin: "14px 0 2px"
             }}>Usuń posiłek z tego dnia</button>
+          )}
+          {!groups.length && (
+            <div style={{ padding: "34px 10px", textAlign: "center", color: MUTED, fontSize: 13.5, lineHeight: 1.6 }}>
+              {pool.length === 0 ? (
+                <>
+                  Wszystkie przepisy w tej kategorii są wyłączone.<br />
+                  <button onClick={onOpenSettings} className="press" style={{
+                    marginTop: 12, border: "none", background: GREEN, color: "#fff", borderRadius: R_CTRL,
+                    padding: "10px 16px", fontSize: 13.5, fontWeight: 600, cursor: "pointer" }}>Dostosuj dietę</button>
+                </>
+              ) : "Nic nie pasuje do wyszukiwania."}
+            </div>
           )}
           {groups.map(g => (
             <div key={g.label}>
@@ -387,23 +404,53 @@ function RecipeModal({ recipe, onClose }) {
 // catalogue and nothing here can be searched for or reused from the picker.
 const QUICK_MAX_KCAL = 5000;
 
+// Saved quick entries ("zapisane"): the shortlist of things a user logs again and again - a banana,
+// an apple, the usual coffee. A saved item is a template, not a logged meal. It carries the same
+// fields as an extras entry but no date, and using one only fills the form: the entry that lands in
+// the day mints its own id, so deleting the logged meal never touches the saved item, and editing
+// one day's portion never rewrites the list. They live in the plans row's `favorites` column,
+// alongside `extras`, and - like everything here - stay out of RECIPES.
+const FAV_MAX = 60;
+const favKey = name => name.trim().toLowerCase();
+const asList = v => (Array.isArray(v) ? v : []);   // a stored column that should be an array, defensively
+const numInput = v => (v === undefined || v === null ? "" : fmtNum(v));
+
 function quickTotals(list) {
   return (list || []).reduce((t, e) => ({
     kcal: t.kcal + (e.kcal || 0), p: t.p + (e.p || 0), f: t.f + (e.f || 0), c: t.c + (e.c || 0), n: t.n + 1,
   }), { kcal: 0, p: 0, f: 0, c: 0, n: 0 });
 }
 
-function QuickEntryModal({ entry, dayLabel, onSave, onDelete, onClose }) {
+function QuickEntryModal({ entry, dayLabel, favorites, favoritesReady, removing,
+                          onSave, onDelete, onDeleteFavorite, onClose }) {
   const isNew = !entry.id;
   const [name, setName] = useState(entry.name || "");
-  const [kcal, setKcal] = useState(entry.kcal === undefined || entry.kcal === null ? "" : fmtNum(entry.kcal));
-  const [p, setP] = useState(entry.p === undefined || entry.p === null ? "" : fmtNum(entry.p));
-  const [c, setC] = useState(entry.c === undefined || entry.c === null ? "" : fmtNum(entry.c));
-  const [f, setF] = useState(entry.f === undefined || entry.f === null ? "" : fmtNum(entry.f));
+  const [kcal, setKcal] = useState(numInput(entry.kcal));
+  const [p, setP] = useState(numInput(entry.p));
+  const [c, setC] = useState(numInput(entry.c));
+  const [f, setF] = useState(numInput(entry.f));
   const [cat, setCat] = useState(entry.cat || "");
   const [macros, setMacros] = useState([entry.p, entry.c, entry.f].some(v => v !== undefined && v !== null));
   const [error, setError] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [remember, setRemember] = useState(false);
+  const [used, setUsed] = useState(null);   // the saved entry this form was filled from, as a receipt
+
+  // Picking a saved entry fills the form rather than logging it outright: half a banana is still a
+  // banana, and the amount is exactly what the user wants to adjust before confirming.
+  const useFavorite = fav => {
+    setName(fav.name);
+    setKcal(numInput(fav.kcal));
+    setP(numInput(fav.p)); setC(numInput(fav.c)); setF(numInput(fav.f));
+    setMacros([fav.p, fav.c, fav.f].some(v => v !== undefined && v !== null));
+    setCat(fav.cat || "");
+    setUsed(fav.id);
+    setError("");
+  };
+
+  const saved = asList(favorites);
+  const trimmed = name.trim();
+  const dup = !!trimmed && saved.some(fv => favKey(fv.name) === favKey(trimmed));
 
   const submit = e => {
     e.preventDefault();
@@ -425,7 +472,7 @@ function QuickEntryModal({ entry, dayLabel, onSave, onDelete, onClose }) {
       kcal: Math.round(kc),
       ...macro,
       cat: cat || null,
-    });
+    }, remember);
   };
 
   const numField = (label, value, setValue, autoFocus) => (
@@ -451,6 +498,44 @@ function QuickEntryModal({ entry, dayLabel, onSave, onDelete, onClose }) {
         </div>
 
         <div style={{ overflowY: "auto", padding: "16px 18px 20px" }}>
+          {!favoritesReady && (
+            <div style={{ background: AMBER_SOFT, color: AMBER_DEEP, borderRadius: R_CTRL, padding: "11px 13px",
+              fontSize: 12.5, fontWeight: 500, lineHeight: 1.5, marginBottom: 16 }}>
+              Lista zapisanych wpisów wymaga kolumny <b>favorites</b> — uruchom ponownie
+              <b> supabase/schema.sql</b> w panelu Supabase. Reszta szybkich wpisów działa normalnie.
+            </div>
+          )}
+
+          {isNew && favoritesReady && saved.length > 0 && (
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ ...sectionLabel(), margin: "0 2px 8px" }}>Zapisane</div>
+              <div style={{ ...listBox, maxHeight: 224, overflowY: "auto" }}>
+                {saved.map((fv, i) => (
+                  <SwipeRow key={fv.id} collapsing={removing === `fav:${fv.id}`}
+                    onDelete={() => onDeleteFavorite(fv)} background={used === fv.id ? GREEN_SOFT : CARD}>
+                    <button type="button" onClick={() => useFavorite(fv)} className="press row" style={{
+                      width: "100%", display: "flex", alignItems: "center", gap: 10, textAlign: "left",
+                      border: "none", borderTop: i ? `1px solid ${LINE}` : "none", background: "transparent",
+                      cursor: "pointer", padding: "9px 12px"
+                    }}>
+                      <span style={{ width: 26, height: 26, borderRadius: 8, flexShrink: 0,
+                        background: used === fv.id ? GREEN : FILL,
+                        display: "flex", alignItems: "center", justifyContent: "center" }}>
+                        <Icon d={used === fv.id ? P_CHECK : P_BOOKMARK} size={13}
+                          color={used === fv.id ? "#fff" : MUTED} stroke={used === fv.id ? 2.6 : 1.9} />
+                      </span>
+                      <span className="ellip" style={{ flex: 1, minWidth: 0, fontSize: 14, fontWeight: 600, color: INK }}>{fv.name}</span>
+                      <span style={{ ...NUM, fontSize: 12.5, color: MUTED, flexShrink: 0 }}>{fv.kcal} kcal</span>
+                    </button>
+                  </SwipeRow>
+                ))}
+              </div>
+              <p style={caption({ fontSize: 12, margin: "8px 2px 0", lineHeight: 1.5 })}>
+                Dotknij, aby wypełnić formularz. Przesuń w lewo, aby usunąć z listy.
+              </p>
+            </div>
+          )}
+
           <label style={{ ...caption(), display: "block", marginBottom: 6 }}>Nazwa</label>
           <input value={name} onChange={e => setName(e.target.value)} autoFocus
             placeholder="np. pizza u Marka" style={{ ...fieldStyle, fontVariantNumeric: "normal" }} />
@@ -482,6 +567,26 @@ function QuickEntryModal({ entry, dayLabel, onSave, onDelete, onClose }) {
                 style={pillBtn(c2 === cat)}>{c2}</button>
             ))}
           </div>
+
+          {favoritesReady && (
+            <button type="button" onClick={() => setRemember(r => !r)} className="press" aria-pressed={remember}
+              style={{ display: "flex", alignItems: "center", gap: 11, width: "100%", marginTop: 20, textAlign: "left",
+                border: `1px solid ${remember ? GREEN : LINE}`, background: remember ? GREEN_SOFT : CARD,
+                borderRadius: R_CTRL, padding: "11px 13px", cursor: "pointer" }}>
+              <span style={{ width: 21, height: 21, borderRadius: 7, flexShrink: 0,
+                background: remember ? GREEN : FILL, border: `1px solid ${remember ? GREEN : LINE}`,
+                display: "flex", alignItems: "center", justifyContent: "center" }}>
+                {remember && <Icon d={P_CHECK} size={12} color="#fff" stroke={2.8} />}
+              </span>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: "block", fontSize: 14, fontWeight: 600, color: INK }}>Zapisz na liście</span>
+                <span style={caption({ fontSize: 12, display: "block", marginTop: 2, lineHeight: 1.45 })}>
+                  {dup ? "Zaktualizuje zapisany wpis o tej nazwie."
+                       : "Następnym razem dodasz go z gotowej listy."}
+                </span>
+              </span>
+            </button>
+          )}
 
           {error && (
             <div style={{ marginTop: 16, background: RED_SOFT, color: RED_DEEP, borderRadius: R_CTRL,
@@ -621,6 +726,15 @@ function sendColumn(userId, column, value) {
     });
 }
 
+// `favorites` and `hidden` were both added after `extras`, so a Supabase project whose schema.sql
+// hasn't been re-run still has the older set of columns. Selecting a column that doesn't exist
+// fails the whole load (42703), which would park the planner behind its load-error card over
+// features nobody has used yet - so the load falls back to the legacy list and only those two go
+// missing. They share one flag because they ship in the same migration: either the SQL has been
+// applied and both work, or it hasn't and neither does.
+const PLAN_COLS = "plan, eaten, goals, extras, favorites, hidden";
+const PLAN_COLS_LEGACY = "plan, eaten, goals, extras";
+
 export default function App({ session }) {
   const user = session.user;
   const today = new Date();
@@ -635,9 +749,17 @@ export default function App({ session }) {
   const [from, setFrom] = useState(keyOf(today));
   const [to, setTo] = useState(keyOf(new Date(today.getTime() + 2*86400000)));
   const [shopChecked, setShopChecked] = useState(() => readShopChecked(user.id));
+  // Which shopping rows are expanded, one flag per product so rows never affect each other. Kept
+  // in memory only: unlike the ticks, this is a glance at "why", not a record of the shopping trip.
+  const [openItems, setOpenItems] = useState({});
+  const toggleItemOpen = key => setOpenItems(o => ({ ...o, [key]: !o[key] }));
 
   const [eaten, setEaten] = useState({});
   const [extras, setExtras] = useState({});   // ad-hoc entries per day, see QuickEntryModal
+  const [favorites, setFavorites] = useState([]);      // saved quick entries, newest first
+  const [hidden, setHidden] = useState([]);            // recipe ids the user switched off
+  const [schemaReady, setSchemaReady] = useState(true); // false = plans has no favorites/hidden yet
+  const [settings, setSettings] = useState(false);
   const [quick, setQuick] = useState(null);  // the entry being added/edited, or null
   const [removing, setRemoving] = useState(null); // key of the row currently collapsing
   const [undo, setUndo] = useState(null);         // what the undo bar would put back
@@ -646,20 +768,20 @@ export default function App({ session }) {
   const [goals, setGoals] = useState(DEFAULT_GOALS);
 
   const alive = useRef(true);
-  const stateRef = useRef({ plan, eaten, goals, extras });
-  useEffect(() => { stateRef.current = { plan, eaten, goals, extras }; });
+  const stateRef = useRef({ plan, eaten, goals, extras, favorites, hidden });
+  useEffect(() => { stateRef.current = { plan, eaten, goals, extras, favorites, hidden }; });
 
   // What the server is known to hold, recorded whenever a load succeeds. The sync effects below
   // compare against it so the state change caused by the load itself doesn't count as an edit -
   // without that, every app open pushed all three columns straight back up.
-  const baseline = useRef({ plan, eaten, goals, extras });
+  const baseline = useRef({ plan, eaten, goals, extras, favorites, hidden });
 
   const loadPlan = useCallback(async () => {
-    const { data, error } = await supabase
-      .from("plans")
-      .select("plan, eaten, goals, extras")
-      .eq("user_id", user.id)
-      .maybeSingle();
+    const read = cols => supabase.from("plans").select(cols).eq("user_id", user.id).maybeSingle();
+    let res = await read(PLAN_COLS);
+    const stale = !!(res.error && res.error.code === "42703"); // no `favorites` column, see above
+    if (stale && alive.current) res = await read(PLAN_COLS_LEGACY);
+    const { data, error } = res;
     if (!alive.current) return;
 
     // Anything left unsent from an earlier session wins over the server copy: it was made on top
@@ -671,12 +793,17 @@ export default function App({ session }) {
       eaten: pending.eaten ?? (data && data.eaten) ?? cur.eaten,
       goals: { ...DEFAULT_GOALS, ...((data && data.goals) || {}), ...(pending.goals || {}) },
       extras: pending.extras ?? (data && data.extras) ?? cur.extras,
+      favorites: stale ? cur.favorites : asList(pending.favorites ?? (data && data.favorites) ?? cur.favorites),
+      hidden: stale ? cur.hidden : asList(pending.hidden ?? (data && data.hidden) ?? cur.hidden),
     };
     baseline.current = next;
     setPlan(next.plan);
     setEaten(next.eaten);
     setGoals(next.goals);
     setExtras(next.extras);
+    setFavorites(next.favorites);
+    setHidden(next.hidden);
+    setSchemaReady(!stale);
 
     if (error) { console.error(error); setLoadState("error"); return; }
 
@@ -740,19 +867,27 @@ export default function App({ session }) {
   // handled here rather than per component so the recipe preview opened on top of the picker
   // closes first instead of both closing at once.
   useEffect(() => {
-    const isOpen = !!(picker || modal || quick);
+    const isOpen = !!(picker || modal || quick || settings);
     document.body.style.overflow = isOpen ? "hidden" : "";
     if (!isOpen) return () => { document.body.style.overflow = ""; };
     const onKey = e => {
       if (e.key !== "Escape") return;
-      if (modal) setModal(null); else if (quick) setQuick(null); else setPicker(null);
+      if (modal) setModal(null);
+      else if (quick) setQuick(null);
+      else if (picker) setPicker(null);
+      else setSettings(false);
     };
     window.addEventListener("keydown", onKey);
     return () => {
       document.body.style.overflow = "";
       window.removeEventListener("keydown", onKey);
     };
-  }, [picker, modal, quick]);
+  }, [picker, modal, quick, settings]);
+
+  // Everything that offers a recipe reads from here - see buildCatalogue. Rebuilt only when the
+  // hidden set actually changes, which also means every dependent view refreshes in the same render.
+  const hiddenSet = useMemo(() => new Set(hidden), [hidden]);
+  const catalogue = useMemo(() => buildCatalogue(hiddenSet), [hiddenSet]);
 
   const targetFor = k => goals.days[k] || goals.global;
 
@@ -775,25 +910,30 @@ export default function App({ session }) {
 
   useEffect(() => { syncCol("extras", extras); }, [extras, loaded, user.id]);
 
-  const clearEaten = (dateKey, cat) => setEaten(p => {
-    if (!p[dateKey] || !p[dateKey][cat]) return p;
-    const day = { ...p[dateKey] };
-    delete day[cat];
-    const np = { ...p };
-    if (Object.keys(day).length) np[dateKey] = day; else delete np[dateKey];
-    return np;
-  });
+  // Skipped while the columns are missing: the write would fail on every retry and leave the header
+  // stuck on "Offline — zapiszę później" for features the user can't reach anyway.
+  useEffect(() => { if (schemaReady) syncCol("favorites", favorites); }, [favorites, schemaReady, loaded, user.id]);
 
-  const toggleEaten = (dateKey, cat) => setEaten(p => {
+  useEffect(() => { if (schemaReady) syncCol("hidden", hidden); }, [hidden, schemaReady, loaded, user.id]);
+
+  // A planned meal carries one status, held in the `eaten` column: `true` (zjedzone), "skip"
+  // (pominiete - planned, then deliberately not eaten) or nothing. One field rather than two
+  // parallel maps, so a meal can never be marked eaten and skipped at once, and it needs no new
+  // column. Marking a meal with the state it already has clears it, which is what makes both
+  // buttons toggles; passing null just clears.
+  const markMeal = (dateKey, cat, value) => setEaten(p => {
+    const cur = (p[dateKey] || {})[cat] ?? null;
+    const next = cur === value ? null : value;
+    if (cur === next) return p;              // nothing to change - don't churn a sync write
     const day = { ...(p[dateKey] || {}) };
-    if (day[cat]) delete day[cat]; else day[cat] = true;
+    if (next) day[cat] = next; else delete day[cat];
     const np = { ...p };
     if (Object.keys(day).length) np[dateKey] = day; else delete np[dateKey];
     return np;
   });
 
   const setMeal = (dateKey, cat, id) => {
-    clearEaten(dateKey, cat);
+    markMeal(dateKey, cat, null);            // a different dish starts with a clean status
     setPlan(p => {
       const day = { ...(p[dateKey] || {}) };
       if (id) day[cat] = id; else delete day[cat];
@@ -827,12 +967,12 @@ export default function App({ session }) {
   const removeMeal = cat => {
     const id = (plan[selected] || {})[cat];
     const r = byId[id];
-    const wasEaten = !!(eaten[selected] || {})[cat];
+    const status = (eaten[selected] || {})[cat];   // true | "skip" | undefined
     const date = selected;
     removeRow(`meal:${cat}`, () => setMeal(date, cat, null),
       { message: `Usunięto: ${r ? r.name : cat}`, restore: () => {
         setPlan(p => ({ ...p, [date]: { ...(p[date] || {}), [cat]: id } }));
-        if (wasEaten) setEaten(p => ({ ...p, [date]: { ...(p[date] || {}), [cat]: true } }));
+        if (status) setEaten(p => ({ ...p, [date]: { ...(p[date] || {}), [cat]: status } }));
       } });
   };
 
@@ -859,7 +999,33 @@ export default function App({ session }) {
     return np;
   });
 
+  // "Zapisz na liście" upserts by name, so logging the same banana twice doesn't grow a list of
+  // duplicate bananas - the second save refreshes the numbers on the one already there, keeping its
+  // id and its place. A brand new one goes to the top, where the next sheet will show it first.
+  const rememberFavorite = item => setFavorites(list => {
+    const fav = { id: crypto.randomUUID(), name: item.name, kcal: item.kcal,
+      p: item.p, f: item.f, c: item.c, cat: item.cat };
+    const at = list.findIndex(f => favKey(f.name) === favKey(item.name));
+    if (at < 0) return [fav, ...list].slice(0, FAV_MAX);
+    const next = [...list];
+    next[at] = { ...fav, id: list[at].id };
+    return next;
+  });
+
+  // Same collapse-then-undo path as deleting a row from the day: the toast sits above the sheet
+  // (z 60 vs the overlay's 45), so it is still reachable with the quick-entry modal open.
+  const removeFavorite = fav => {
+    const index = favorites.findIndex(f => f.id === fav.id);
+    removeRow(`fav:${fav.id}`, () => setFavorites(l => l.filter(f => f.id !== fav.id)),
+      { message: `Usunięto z zapisanych: ${fav.name}`, restore: () => setFavorites(l => {
+        const list = l.filter(f => f.id !== fav.id);
+        list.splice(Math.min(index < 0 ? list.length : index, list.length), 0, fav);
+        return list;
+      }) });
+  };
+
   const fillDay = () => {
+    if (!catalogue.canDraw) return;        // a slot with nothing visible has nothing to draw
     setEaten(p => {
       if (!p[selected]) return p;
       const np = { ...p };
@@ -870,20 +1036,32 @@ export default function App({ session }) {
     const current = CATS.map(c => (plan[selected] || {})[c]).join(",");
     let pick = null;
     for (let attempt = 0; attempt < 4; attempt++) { // re-draw if we land on the day already shown
-      pick = drawDay(goal);
+      pick = drawDay(catalogue, goal);
       if (pick.map(r => r.id).join(",") !== current) break;
     }
     setPlan(p => ({ ...p, [selected]: Object.fromEntries(CATS.map((cat, i) => [cat, pick[i].id])) }));
   };
 
   // A day's numbers are the planned meals plus anything logged ad-hoc that day.
+  // A day's numbers are the planned meals plus anything logged ad-hoc that day. A meal marked
+  // "skip" is planned but not going to be eaten, so it leaves the totals entirely - otherwise the
+  // figure the goal is judged against would describe a day the user already said isn't happening.
+  // `planned` still counts it, so a day of nothing but skipped meals reads as a planned day at
+  // 0 kcal rather than as an empty one.
   const dayTotals = dateKey => {
     const day = plan[dateKey] || {};
-    let kcal=0,pr=0,f=0,c=0,n=0;
-    CATS.forEach(cat => { const r = byId[day[cat]]; if (r){ kcal+=r.kcal; pr+=r.p; f+=r.f; c+=r.c; n++; } });
+    const st = eaten[dateKey] || {};
+    let kcal=0,pr=0,f=0,c=0,n=0,planned=0,skipped=0;
+    CATS.forEach(cat => {
+      const r = byId[day[cat]];
+      if (!r) return;
+      planned++;
+      if (st[cat] === "skip") { skipped++; return; }
+      kcal+=r.kcal; pr+=r.p; f+=r.f; c+=r.c; n++;
+    });
     const q = quickTotals(extras[dateKey]);
     kcal+=q.kcal; pr+=q.p; f+=q.f; c+=q.c; n+=q.n;
-    return n ? { kcal, p: pr, f, c, n, quick: q } : null;
+    return (planned || q.n) ? { kcal, p: pr, f, c, n, quick: q, skipped } : null;
   };
 
   // calendar grid
@@ -904,26 +1082,63 @@ export default function App({ session }) {
   }, [view]);
 
   // shopping list
+  // Every line on the list is one product summed across the range, and it carries the meals that
+  // sum came from (`sources`) so a row can be expanded back into its parts. The breakdown is built
+  // here rather than recomputed on expand: the walk over planned days already visits exactly the
+  // right meals, and doing it twice would risk the two disagreeing.
+  //
+  // The item's own total is then computed *from* its sources rather than accumulated alongside
+  // them, so the breakdown adds up to the header by construction and not by luck: every figure on
+  // screen is rounded to the same 0.1 g, and the header is the rounded sum of exactly the numbers
+  // printed underneath it.
   const shopping = useMemo(() => {
     if (tab !== "shop") return null;
     const items = {}; let meals = 0, kcal = 0; const days = new Set();
     let a = from, b = to; if (a > b) [a, b] = [b, a];
     const d = new Date(a + "T12:00:00"); const end = new Date(b + "T12:00:00");
     while (d <= end) {
-      const k = keyOf(d); const day = plan[k];
+      const k = keyOf(d); const day = plan[k]; const st = eaten[k] || {};
       if (day) CATS.forEach(cat => {
+        if (st[cat] === "skip") return;      // skipped: not cooked, so nothing to buy for it
         const r = byId[day[cat]]; if (!r) return;
         meals++; kcal += r.kcal; days.add(k);
         r.ing.forEach(i => {
           const ak = aggKey(i.n);
           if (ak === "woda") return;
-          if (!items[ak]) items[ak] = { name: ak.charAt(0).toUpperCase() + ak.slice(1), g: 0, uses: 0, cat: ING_CAT[ak] || "Inne" };
-          items[ak].g += (i.g || 0) / r.port;
-          items[ak].uses++;
+          if (!items[ak]) items[ak] = { name: ak.charAt(0).toUpperCase() + ak.slice(1), g: 0, cat: ING_CAT[ak] || "Inne", sources: [], at: {} };
+          const g = Math.round(((i.g || 0) / r.port) * 10) / 10;   // one portion's worth
+          const sk = `${k}:${cat}`;
+          const seen = items[ak].at[sk];
+          if (seen !== undefined) {
+            // One dish can list the same product on several lines - 36 recipes do, mostly spices
+            // split per component ("Sól", "Sól (do masła)", "Sól (do ziemniaków)"), which `aggKey`
+            // folds together by stripping the bracket. A meal is one source, so the lines merge:
+            // the grams add up, and the household measure goes, since it only ever described one
+            // of them. Leaving them separate would also hand React two rows with the same key.
+            const prev = items[ak].sources[seen];
+            prev.g = Math.round((prev.g + g) * 10) / 10;
+            prev.measure = null;
+            return;
+          }
+          items[ak].at[sk] = items[ak].sources.length;
+          items[ak].sources.push({
+            key: sk, date: k, cat, recipeId: r.id, name: r.name, g,
+            // Shown only for a single-portion recipe: for a dish that makes four, `d` describes the
+            // whole tray, not the one portion this day contributes. 269 of the 280 recipes are
+            // `port: 1`, so the measure is there nearly always. `recipeId`/`date`/`cat` are kept so
+            // a source can later become a tap-through to the meal it came from.
+            measure: r.port === 1 ? houseMeasure(i.d) : null,
+          });
         });
       });
       d.setDate(d.getDate() + 1);
     }
+    const catOrder = Object.fromEntries(CATS.map((c, n) => [c, n]));
+    Object.values(items).forEach(it => {
+      it.sources.sort((x, y) => x.date.localeCompare(y.date) || catOrder[x.cat] - catOrder[y.cat]);
+      it.g = Math.round(it.sources.reduce((sum, x) => sum + x.g, 0) * 10) / 10;
+      delete it.at;
+    });
     const groups = SHOP_CATS.map(cat => ({
       cat,
       items: Object.entries(items).map(([k, v]) => ({ key: k, ...v }))
@@ -932,7 +1147,7 @@ export default function App({ session }) {
     })).filter(g => g.items.length);
     const total = groups.reduce((s, g) => s + g.items.length, 0);
     return { groups, total, meals, kcal, days: days.size };
-  }, [tab, from, to, plan]);
+  }, [tab, from, to, plan, eaten]);
 
   // Ticks belong to one date range: change the range and the list starts unticked again.
   const shopRange = rangeOf(from, to);
@@ -952,7 +1167,8 @@ export default function App({ session }) {
   const sel = plan[selected] || {};
   const totals = dayTotals(selected);
   // The draw aims at what is left of the goal once ad-hoc entries are accounted for. Four meals
-  // can never total less than MIN_DAY, so a big quick entry can put that target out of reach -
+  // can never total less than the catalogue's minDay, so a big quick entry - or switching enough
+  // recipes off to raise that floor - can put the target out of reach -
   // the button says which number it is really aiming at and the hint owns up when it cannot hit it.
   const quickKcal = quickTotals(extras[selected]).kcal;
   const drawTarget = targetFor(selected) - quickKcal;
@@ -990,7 +1206,11 @@ export default function App({ session }) {
           <div style={{ display: "flex", alignItems: "center", gap: 12, justifyContent: "space-between" }}>
             <div style={{ minWidth: 0 }}>
               <h1 style={{ fontSize: 22, fontWeight: 700, margin: 0, letterSpacing: -0.5 }}>Planer diety</h1>
-              <div style={{ ...caption({ marginTop: 2 }), ...NUM }}>{RECIPES.length} {plural(RECIPES.length, "przepis", "przepisy", "przepisów")} · cel {goals.global} kcal</div>
+              <div style={{ ...caption({ marginTop: 2 }), ...NUM }}>
+                {catalogue.visible < RECIPES.length
+                  ? `${catalogue.visible} z ${RECIPES.length} przepisów`
+                  : `${RECIPES.length} ${plural(RECIPES.length, "przepis", "przepisy", "przepisów")}`} · cel {goals.global} kcal
+              </div>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
               {unsaved && (
@@ -1001,6 +1221,10 @@ export default function App({ session }) {
                   {online ? "Zapisywanie…" : "Offline"}
                 </span>
               )}
+              <button onClick={() => setSettings(true)} title="Dostosuj dietę" aria-label="Dostosuj dietę"
+                className="press" style={iconBtn}>
+                <Icon d={P_SLIDERS} size={16} color={INK_SOFT} stroke={2} />
+              </button>
               <button onClick={() => supabase.auth.signOut()} title={user.email} className="press"
                 style={{ border: `1px solid ${LINE}`, background: CARD, color: INK_SOFT, borderRadius: R_PILL,
                   padding: "7px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Wyloguj</button>
@@ -1059,7 +1283,7 @@ export default function App({ session }) {
                       : { bar: AMBER, bg: AMBER_SOFT, fg: AMBER_DEEP };
                     const eDay = eaten[selected] || {};
                     let eKcal = 0, eN = 0;
-                    CATS.forEach(cat => { const r = byId[sel[cat]]; if (r && eDay[cat]) { eKcal += r.kcal; eN++; } });
+                    CATS.forEach(cat => { const r = byId[sel[cat]]; if (r && eDay[cat] === true) { eKcal += r.kcal; eN++; } });
                     // Ad-hoc entries are logged after the fact, so they always count as eaten.
                     eKcal += totals.quick.kcal; eN += totals.quick.n;
                     return (
@@ -1091,36 +1315,59 @@ export default function App({ session }) {
               <div style={listBox}>
                 {CATS.map((cat, i) => {
                   const r = byId[sel[cat]];
-                  const isEaten = !!(eaten[selected] || {})[cat];
+                  const status = (eaten[selected] || {})[cat] ?? null;
+                  const isEaten = status === true;
+                  const isSkipped = status === "skip";
+                  const rowBg = isEaten ? GREEN_SOFT : isSkipped ? FILL : CARD;
                   return (
                     <SwipeRow key={cat} disabled={!r} collapsing={removing === `meal:${cat}`}
-                      background={isEaten ? GREEN_SOFT : CARD} onDelete={() => removeMeal(cat)}>
-                    <div style={{ borderTop: i ? `1px solid ${LINE}` : "none", background: isEaten ? GREEN_SOFT : CARD }}>
+                      background={rowBg} onDelete={() => removeMeal(cat)}>
+                    <div style={{ borderTop: i ? `1px solid ${LINE}` : "none", background: rowBg }}>
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "10px 12px 0" }}>
-                        <span style={{ background: CAT_TINT[cat].bg, color: CAT_TINT[cat].fg, borderRadius: R_PILL, padding: "3px 10px", fontSize: 11.5, fontWeight: 700 }}>{cat}</span>
+                        <span style={{ background: CAT_TINT[cat].bg, color: CAT_TINT[cat].fg, borderRadius: R_PILL,
+                          padding: "3px 10px", fontSize: 11.5, fontWeight: 700, opacity: isSkipped ? 0.55 : 1 }}>{cat}</span>
                         {r && (
                           <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
                             <button onClick={() => setModal(r)} className="press" style={linkBtn}>Przepis</button>
-                            <button onClick={() => toggleEaten(selected, cat)} title={isEaten ? "Cofnij oznaczenie" : "Oznacz jako zjedzone"} className="press"
-                              style={{ display: "inline-flex", alignItems: "center", gap: 5, border: `1px solid ${isEaten ? GREEN : LINE}`,
-                                background: isEaten ? GREEN : CARD, color: isEaten ? "#fff" : MUTED, borderRadius: R_PILL,
-                                padding: "4px 11px", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
-                              {isEaten && <Icon d={P_CHECK} size={12} stroke={2.8} />}
-                              {isEaten ? "Zjedzone" : "Zjedzone?"}
-                            </button>
+                            {/* Eaten and skipped are the same field, so each state offers only the
+                                move still open to it: a skipped meal shows its own pill and no
+                                "Zjedzone?", an eaten one hides the skip button. Neither can be
+                                reached without first clearing the other, which is the point. */}
+                            {!isEaten && (
+                              <button onClick={() => markMeal(selected, cat, "skip")} className="press"
+                                title={isSkipped ? "Cofnij pominięcie" : "Pomiń ten posiłek"}
+                                aria-label={isSkipped ? "Cofnij pominięcie" : "Pomiń ten posiłek"} aria-pressed={isSkipped}
+                                style={{ display: "inline-flex", alignItems: "center", gap: 5, border: `1px solid ${isSkipped ? MUTED : LINE}`,
+                                  background: isSkipped ? MUTED : CARD, color: isSkipped ? "#fff" : MUTED, borderRadius: R_PILL,
+                                  padding: isSkipped ? "4px 11px" : "4px 8px", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
+                                <Icon d={P_SKIP} size={12} stroke={2.2} />
+                                {isSkipped && "Pominięte"}
+                              </button>
+                            )}
+                            {!isSkipped && (
+                              <button onClick={() => markMeal(selected, cat, true)} className="press"
+                                title={isEaten ? "Cofnij oznaczenie" : "Oznacz jako zjedzone"} aria-pressed={isEaten}
+                                style={{ display: "inline-flex", alignItems: "center", gap: 5, border: `1px solid ${isEaten ? GREEN : LINE}`,
+                                  background: isEaten ? GREEN : CARD, color: isEaten ? "#fff" : MUTED, borderRadius: R_PILL,
+                                  padding: "4px 11px", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
+                                {isEaten && <Icon d={P_CHECK} size={12} stroke={2.8} />}
+                                {isEaten ? "Zjedzone" : "Zjedzone?"}
+                              </button>
+                            )}
                           </span>
                         )}
                       </div>
                       <button onClick={() => setPicker(cat)} className="press row" style={{
                         width: "100%", display: "flex", alignItems: "center", gap: 12, textAlign: "left",
                         border: "none", background: "transparent", cursor: "pointer",
-                        padding: r ? "10px 12px 12px" : "12px 12px 16px"
+                        padding: r ? "10px 12px 12px" : "12px 12px 16px", opacity: isSkipped ? 0.5 : 1
                       }}>
                         {r ? (
                           <>
                             <RecipeThumb key={r.id} r={r} size={50} />
                             <div style={{ flex: 1, minWidth: 0 }}>
-                              <div className="clamp2" style={{ fontSize: 14.5, fontWeight: 600, color: INK, lineHeight: 1.3 }}>{r.name}</div>
+                              <div className="clamp2" style={{ fontSize: 14.5, fontWeight: 600, color: INK, lineHeight: 1.3,
+                                textDecoration: isSkipped ? "line-through" : "none" }}>{r.name}</div>
                               <div style={{ marginTop: 6 }}><MacroChips r={r} size="sm" /></div>
                             </div>
                             <Icon d={P_CHEVRON} size={18} color={MUTED} />
@@ -1182,18 +1429,30 @@ export default function App({ session }) {
                 <Icon d={P_PLUS} size={16} color={GREEN_DEEP} stroke={2.2} /> Szybki wpis
               </button>
 
-              <button onClick={fillDay} className="press" style={{
-                marginTop: 10, width: "100%", background: GREEN, color: "#fff", border: "none", borderRadius: R_CTRL,
-                padding: "14px 18px", fontSize: 15, fontWeight: 600, cursor: "pointer", boxShadow: GREEN_GLOW
+              <button onClick={fillDay} disabled={!catalogue.canDraw} className="press" style={{
+                marginTop: 10, width: "100%", background: catalogue.canDraw ? GREEN : FILL,
+                color: catalogue.canDraw ? "#fff" : MUTED, border: "none", borderRadius: R_CTRL,
+                padding: "14px 18px", fontSize: 15, fontWeight: 600,
+                cursor: catalogue.canDraw ? "pointer" : "not-allowed",
+                boxShadow: catalogue.canDraw ? GREEN_GLOW : "none"
               }}>Wylosuj dzień pod {Math.max(drawTarget, 0)} kcal</button>
               <p style={{ fontSize: 12.5, color: MUTED, margin: "10px 2px 0", lineHeight: 1.55 }}>
                 Losuje 4 posiłki tak, aby suma trafiła w cel (±50 kcal). Kliknij ponownie, jeśli zestaw nie pasuje.
                 {quickKcal > 0 && ` Odliczone ${quickKcal} kcal z szybkich wpisów.`}
               </p>
-              {quickKcal > 0 && drawTarget < MIN_DAY && (
+              {!catalogue.canDraw && (
                 <p style={{ fontSize: 12.5, color: AMBER_DEEP, background: AMBER_SOFT, borderRadius: R_CTRL,
                   padding: "10px 12px", margin: "10px 0 0", lineHeight: 1.55 }}>
-                  Zostało {Math.max(drawTarget, 0)} kcal, a 4 posiłki z bazy to minimum {MIN_DAY} kcal — losowanie
+                  Losowanie jest wyłączone: w {catalogue.emptySlots.length === 1 ? "kategorii" : "kategoriach"}{" "}
+                  {catalogue.emptySlots.join(", ")} nie został żaden widoczny przepis.{" "}
+                  <button onClick={() => setSettings(true)} className="press"
+                    style={{ ...linkBtn, color: AMBER_DEEP, textDecoration: "underline", padding: 0 }}>Włącz coś z powrotem</button>.
+                </p>
+              )}
+              {catalogue.canDraw && quickKcal > 0 && drawTarget < catalogue.minDay && (
+                <p style={{ fontSize: 12.5, color: AMBER_DEEP, background: AMBER_SOFT, borderRadius: R_CTRL,
+                  padding: "10px 12px", margin: "10px 0 0", lineHeight: 1.55 }}>
+                  Zostało {Math.max(drawTarget, 0)} kcal, a 4 posiłki z twojej puli to minimum {catalogue.minDay} kcal — losowanie
                   wyjdzie ponad cel. Dobierz posiłki ręcznie albo usuń któryś szybki wpis.
                 </p>
               )}
@@ -1231,9 +1490,15 @@ export default function App({ session }) {
                     }}>
                       <span style={{ fontSize: 14, fontWeight: isSel || isToday ? 700 : 500, ...NUM }}>{dt.getDate()}</span>
                       <span style={{ display: "flex", gap: 3, height: 5 }}>
-                        {CATS.map(c => byId[day[c]] || (extras[k] || []).some(e => e.cat === c)
-                          ? <span key={c} style={{ width: 5, height: 5, borderRadius: R_PILL, background: isSel ? "rgba(255,255,255,.92)" : CAT_COLORS[c] }} />
-                          : null)}
+                        {CATS.map(c => {
+                          const quickHere = (extras[k] || []).some(e => e.cat === c);
+                          if (!byId[day[c]] && !quickHere) return null;
+                          // A skipped meal still marks where the day was planned, only faded: its
+                          // kcal has left the cell's total, so a full-strength dot would overstate it.
+                          const faded = !quickHere && (eaten[k] || {})[c] === "skip";
+                          return <span key={c} style={{ width: 5, height: 5, borderRadius: R_PILL,
+                            background: isSel ? "rgba(255,255,255,.92)" : CAT_COLORS[c], opacity: faded ? 0.3 : 1 }} />;
+                        })}
                         {(extras[k] || []).some(e => !e.cat) && (
                           <span style={{ width: 5, height: 5, borderRadius: R_PILL, background: isSel ? "rgba(255,255,255,.92)" : MUTED }} />
                         )}
@@ -1274,7 +1539,9 @@ export default function App({ session }) {
                   <div style={{ fontSize: 14.5, fontWeight: 600, color: GREEN_DEEP, ...NUM }}>
                     {shopping.days} {plural(shopping.days, "dzień", "dni", "dni")} · {shopping.meals} {plural(shopping.meals, "posiłek", "posiłki", "posiłków")} · {shopping.kcal} kcal
                   </div>
-                  <div style={{ fontSize: 12.5, color: INK_SOFT, marginTop: 3 }}>Ilości przeliczone na 1 porcję i zsumowane.</div>
+                  <div style={{ fontSize: 12.5, color: INK_SOFT, marginTop: 3 }}>
+                    Ilości przeliczone na 1 porcję i zsumowane. Rozwiń pozycję, aby zobaczyć, z których posiłków wynika.
+                  </div>
                 </div>
                 {shopping.groups.map(group => {
                   const doneIn = group.items.filter(i => checked[i.key]).length;
@@ -1287,16 +1554,53 @@ export default function App({ session }) {
                       <ul style={{ ...listBox, listStyle: "none", padding: 0, margin: 0 }}>
                         {group.items.map((item, idx) => {
                           const done = checked[item.key];
+                          const open = !!openItems[item.key];
+                          const n = item.sources.length;
                           return (
                             <li key={item.key} style={{ borderTop: idx ? `1px solid ${LINE}` : "none" }}>
-                              <label className="row" style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 14px",
-                                cursor: "pointer", background: done ? FILL : CARD }}>
-                                <input type="checkbox" checked={!!done} onChange={() => toggleChecked(item.key)}
-                                  style={{ width: 19, height: 19, accentColor: GREEN, flexShrink: 0, cursor: "pointer" }} />
-                                <span style={{ flex: 1, fontSize: 14.5, fontWeight: 500, color: done ? MUTED : INK,
-                                  textDecoration: done ? "line-through" : "none" }}>{item.name}</span>
-                                <span style={{ fontSize: 13, fontWeight: 600, color: done ? MUTED : INK_SOFT, ...NUM }}>{fmtG(item.g)}</span>
-                              </label>
+                              {/* Ticking keeps the whole row as its target, the way it always has.
+                                  The chevron is a sibling of the <label>, not a child: inside it,
+                                  every tap that opened the breakdown would also tick the item off. */}
+                              <div style={{ display: "flex", alignItems: "stretch", background: done ? FILL : CARD }}>
+                                <label className="row" style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center",
+                                  gap: 12, padding: "11px 6px 11px 14px", cursor: "pointer" }}>
+                                  <input type="checkbox" checked={!!done} onChange={() => toggleChecked(item.key)}
+                                    style={{ width: 19, height: 19, accentColor: GREEN, flexShrink: 0, cursor: "pointer" }} />
+                                  <span style={{ flex: 1, fontSize: 14.5, fontWeight: 500, color: done ? MUTED : INK,
+                                    textDecoration: done ? "line-through" : "none" }}>{item.name}</span>
+                                  <span style={{ fontSize: 13, fontWeight: 600, color: done ? MUTED : INK_SOFT, ...NUM }}>{fmtG(item.g)}</span>
+                                </label>
+                                <button type="button" onClick={() => toggleItemOpen(item.key)} className="press" aria-expanded={open}
+                                  aria-label={`${open ? "Ukryj" : "Pokaż"} rozbicie: ${item.name}, z ${n} ${plural(n, "posiłku", "posiłków", "posiłków")}`}
+                                  style={{ border: "none", background: "transparent", cursor: "pointer",
+                                    padding: "0 13px", display: "flex", alignItems: "center", flexShrink: 0 }}>
+                                  <span style={{ display: "flex", transform: open ? "rotate(90deg)" : "none",
+                                    transition: "transform .2s cubic-bezier(.2,.8,.3,1)" }}>
+                                    <Icon d={P_CHEVRON} size={15} color={MUTED} />
+                                  </span>
+                                </button>
+                              </div>
+                              {/* Stays mounted so the height can animate; `aria-hidden` keeps the
+                                  collapsed breakdown out of a screen reader all the same. The cap is
+                                  an over-estimate of the rendered height - each source is exactly two
+                                  ellipsised lines, so it never clips. */}
+                              <div aria-hidden={!open} style={{
+                                maxHeight: open ? n * 54 + 8 : 0, opacity: open ? 1 : 0, overflow: "hidden",
+                                background: done ? FILL : CARD,
+                                transition: "max-height .24s cubic-bezier(.2,.8,.3,1), opacity .18s ease" }}>
+                                {item.sources.map(src => (
+                                  <div key={src.key} style={{ display: "flex", alignItems: "center", gap: 10,
+                                    padding: "8px 14px 8px 45px", borderTop: `1px solid ${LINE}` }}>
+                                    <span style={{ flex: 1, minWidth: 0 }}>
+                                      <span className="ellip" style={{ display: "block", fontSize: 13, fontWeight: 500, color: INK_SOFT }}>{src.name}</span>
+                                      <span className="ellip" style={{ display: "block", ...caption({ fontSize: 11.5, marginTop: 1 }), ...NUM }}>
+                                        {fmtShort(src.date)} · {src.cat}{src.measure ? ` · ${src.measure}` : ""}
+                                      </span>
+                                    </span>
+                                    <span style={{ fontSize: 12.5, fontWeight: 600, color: MUTED, flexShrink: 0, ...NUM }}>{fmtG(src.g)}</span>
+                                  </div>
+                                ))}
+                              </div>
                             </li>
                           );
                         })}
@@ -1319,11 +1623,16 @@ export default function App({ session }) {
       </main>
 
       {picker && (
-        <PickerModal cat={picker} currentId={(plan[selected] || {})[picker]}
+        <PickerModal cat={picker} pool={catalogue.bySlot[picker]} currentId={(plan[selected] || {})[picker]}
+          onOpenSettings={() => { setPicker(null); setSettings(true); }}
           ctx={(() => {
             const day = plan[selected] || {};
+            const st = eaten[selected] || {};
             let others = 0, filled = 0;
-            CATS.forEach(c => { if (c !== picker) { const r = byId[day[c]]; if (r) { others += r.kcal; filled++; } } });
+            CATS.forEach(c => {
+              if (c === picker || st[c] === "skip") return;   // a skipped meal is not part of the day
+              const r = byId[day[c]]; if (r) { others += r.kcal; filled++; }
+            });
             const q = quickTotals(extras[selected]);
             others += q.kcal; filled += q.n;
             const goal = targetFor(selected);
@@ -1339,10 +1648,16 @@ export default function App({ session }) {
           onUndo={() => { undo.restore(); setUndo(null); }}
           onDismiss={() => setUndo(null)} />
       )}
+      {settings && (
+        <Settings hidden={hidden} hiddenSet={hiddenSet} catalogue={catalogue} schemaReady={schemaReady}
+          onChange={setHidden} onClose={() => setSettings(false)} />
+      )}
       {quick && (
         <QuickEntryModal entry={quick} dayLabel={fmtPL(selected)}
-          onSave={item => { saveQuick(item); setQuick(null); }}
+          favorites={favorites} favoritesReady={schemaReady} removing={removing}
+          onSave={(item, remember) => { saveQuick(item); if (remember) rememberFavorite(item); setQuick(null); }}
           onDelete={id => { deleteQuick(id); setQuick(null); }}
+          onDeleteFavorite={removeFavorite}
           onClose={() => setQuick(null)} />
       )}
     </div>
