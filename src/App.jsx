@@ -192,7 +192,7 @@ function readShopChecked(userId) {
   } catch { return { range: "", items: NO_TICKS }; }
 }
 
-const TARGETS = [2400, 2500, 2600, 2700];
+const TARGETS = [2400, 2500, 2600, 2700, 2800];
 const DEFAULT_GOALS = { global: 2400, days: {} };
 
 // Rendered only while open (and therefore remounted on every open), so the search box and plan
