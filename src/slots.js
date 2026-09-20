@@ -36,7 +36,15 @@ export const SLOT_RULES = [
 // it narrows, e.g. 163: ["Śniadanie", "Kolacja"] offers "Bułka owsiana z łososiem" at both ends of
 // the day, and 5: ["Śniadanie", "Przekąska"] would let one porridge through as a snack.
 // Keyed by id, so re-check these after `data/recipes.js` is regenerated.
-export const SLOT_OVERRIDES = {};
+//
+// 282/292/293 are the three "Wysokobiałkowe na masę" meal-prep recipes explicitly called out as
+// good for both obiad and kolacja (see their `group` field in data/recipes.js) — widened rather
+// than re-filed so they keep showing under Obiad too.
+export const SLOT_OVERRIDES = {
+  282: ["Obiad", "Kolacja"],
+  292: ["Obiad", "Kolacja"],
+  293: ["Obiad", "Kolacja"],
+};
 
 const isCat = c => CATS.includes(c);
 
